@@ -597,7 +597,7 @@ let emailTransporter = null;
 const getEmailTransporter = () => {
   if (!emailTransporter) {
     try {
-      const emailUser = process.env.EMAIL_USER || 'stanzokinyua6759@gmail.com';
+      const emailUser = process.env.EMAIL_USER || 'kinyuastanzo6759@gmail.com';
       const emailPass = process.env.EMAIL_PASSWORD || 'amzimbywdjplkdty';
 
       console.log('📧 Configuring email transporter...');
@@ -1368,7 +1368,7 @@ const sendSecureCodeEmail = async (email, secureCode) => {
     const mailOptions = {
       from: {
         name: 'Stanzo Shop Management',
-        address: process.env.EMAIL_USER || 'stanzokinyua6759@gmail.com'
+        address: process.env.EMAIL_USER || 'kinyuastanzo6759@gmail.com'
       },
       to: email,
       subject: 'Your Secure Login Code - Stanzo Shop Management',
