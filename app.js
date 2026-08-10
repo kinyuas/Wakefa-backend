@@ -282,7 +282,7 @@ app.use(express.urlencoded({ extended: true }));
 
 // 2. Enhanced CORS Configuration for serverless
 const allowedOrigins = [
-  'https://front1-beta.vercel.app',
+  'http://localhost:3000',
   // 'https://back2-khaki.vercel.app',
   'http://localhost:3000',
   'http://localhost:3001',

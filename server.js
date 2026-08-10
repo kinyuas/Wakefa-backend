@@ -1,24 +1,228 @@
+// server.js - Stanzo Shop Management System
 const express = require('express');
-const cors = require('cors');
 const mongoose = require('mongoose');
-const helmet = require('helmet');
-const morgan = require('morgan');
-const rateLimit = require('express-rate-limit');
-const compression = require('compression');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const nodemailer = require('nodemailer');
 const { body, validationResult } = require('express-validator');
 const crypto = require('crypto');
+const dayjs = require('dayjs');
+
+// Import dependencies with fallbacks for serverless
+let cors, helmet, morgan, rateLimit, compression;
+try {
+  cors = require('cors');
+  helmet = require('helmet');
+  morgan = require('morgan');
+  rateLimit = require('express-rate-limit');
+  compression = require('compression');
+} catch (e) {
+  console.warn('Some dependencies not installed, using fallbacks');
+  // Simple CORS middleware as fallback
+  cors = (options) => (req, res, next) => {
+    const origin = req.headers.origin;
+    const allowedOrigins = [
+      'http://localhost:3000',
+      'http://localhost:3001',
+      'http://localhost:3002',
+      'http://localhost:3003',
+      'http://localhost:5173',
+      'http://localhost:5174',
+      'http://localhost:5175',
+      'http://localhost:3000',
+      'https://front1-lvfitof14-stanzos-projects.vercel.app',
+      'https://front1-hqoeqlxqg-stanzos-projects.vercel.app',
+      'https://front1-bunkdw5st-stanzos-projects.vercel.app',
+      'https://back2.vercel.app',
+      'https://back2-git-main-stanzos-projects.vercel.app',
+      'https://back2-7qq5a2p8l-stanzos-projects.vercel.app'
+    ];
+    
+    if (origin && allowedOrigins.includes(origin)) {
+      res.header('Access-Control-Allow-Origin', origin);
+    } else if (!origin) {
+      res.header('Access-Control-Allow-Origin', '*');
+    }
+    
+    res.header('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS,PATCH');
+    res.header('Access-Control-Allow-Headers', 'Content-Type,Authorization,X-Requested-With');
+    res.header('Access-Control-Allow-Credentials', 'true');
+    
+    if (req.method === 'OPTIONS') {
+      return res.status(204).end();
+    }
+    next();
+  };
+  helmet = () => (req, res, next) => next();
+  morgan = () => (req, res, next) => next();
+  rateLimit = () => (req, res, next) => next();
+  compression = () => (req, res, next) => next();
+}
+
 require('dotenv').config();
 
 const app = express();
 
-// ==================== ENHANCED MODELS WITH BARCODE SUPPORT ====================
+// ==================== CORS CONFIGURATION ====================
+
+const allowedOrigins = [
+  // Local development
+  'http://localhost:3000',
+  'http://localhost:3001',
+  'http://localhost:3002',
+  'http://localhost:3003',
+  'http://localhost:5173',
+  'http://localhost:5174',
+  'http://localhost:5175',
+  'http://127.0.0.1:3000',
+  'http://127.0.0.1:3001',
+  'http://127.0.0.1:3002',
+  'http://127.0.0.1:3003',
+  'http://127.0.0.1:5173',
+  'http://127.0.0.1:5174',
+  'http://127.0.0.1:5175',
+  
+  // Production domains
+  'https://wadave-supermarket.com',
+  'https://www.wadave-supermarket.com',
+  'https://admin.wadave-supermarket.com',
+  'https://pos.wadave-supermarket.com',
+  'https://api.wadave-supermarket.com',
+  
+  // Vercel deployment domains
+  'http://localhost:3000',
+  'https://front1-lvfitof14-stanzos-projects.vercel.app',
+  'https://front1-hqoeqlxqg-stanzos-projects.vercel.app',
+  'https://front1-bunkdw5st-stanzos-projects.vercel.app',
+  'https://back2.vercel.app',
+  'https://back2-git-main-stanzos-projects.vercel.app',
+  'https://back2-7qq5a2p8l-stanzos-projects.vercel.app'
+];
+
+const corsOptions = {
+  origin: function (origin, callback) {
+    if (!origin || process.env.NODE_ENV !== 'production') {
+      return callback(null, true);
+    }
+    if (allowedOrigins.indexOf(origin) !== -1) {
+      callback(null, true);
+    } else {
+      callback(new Error('CORS policy: This origin is not allowed'));
+    }
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'Origin'],
+  exposedHeaders: ['Content-Range', 'X-Content-Range', 'X-Total-Count', 'X-New-Token'],
+  maxAge: 86400,
+  optionsSuccessStatus: 204
+};
+
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions));
+
+// ==================== SECURITY MIDDLEWARE ====================
+
+app.use(helmet({
+  contentSecurityPolicy: false,
+  crossOriginEmbedderPolicy: false,
+  crossOriginResourcePolicy: { policy: "cross-origin" }
+}));
+
+app.use((req, res, next) => {
+  res.removeHeader('X-Powered-By');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('X-XSS-Protection', '1; mode=block');
+  next();
+});
+
+app.use(compression({ level: 6, threshold: 1024 }));
+
+// Body parsing with limits
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+// Request ID middleware
+app.use((req, res, next) => {
+  req.id = crypto.randomBytes(16).toString('hex');
+  res.setHeader('X-Request-ID', req.id);
+  next();
+});
+
+// Device detection
+app.use((req, res, next) => {
+  const userAgent = req.headers['user-agent'] || '';
+  req.deviceType = /mobile/i.test(userAgent) ? 'mobile' : /tablet/i.test(userAgent) ? 'tablet' : 'desktop';
+  req.platform = /android/i.test(userAgent) ? 'android' : /iphone|ipad|ipod/i.test(userAgent) ? 'ios' : 'unknown';
+  next();
+});
+
+// ==================== DATABASE CONNECTION MANAGER ====================
+
+let cachedConnection = null;
+let cachedModels = null;
+
+const connectDB = async () => {
+  if (cachedConnection && cachedConnection.readyState === 1) {
+    console.log('✅ Using existing database connection');
+    return cachedConnection;
+  }
+
+  try {
+    if (cachedConnection) {
+      await mongoose.disconnect();
+    }
+
+    const connectionString = process.env.MONGODB_URI || 'mongodb+srv://kinyuastanzo6759_db_user:Y9P9gdROuewvBmq8@cluster0.4rtcx4y.mongodb.net/kianjirusupermarket_db?retryWrites=true&w=majority';
+    
+    const options = {
+      serverSelectionTimeoutMS: 10000,
+      socketTimeoutMS: 30000,
+      maxPoolSize: 5,
+      minPoolSize: 1,
+      maxIdleTimeMS: 10000,
+      connectTimeoutMS: 10000,
+      retryWrites: true,
+      bufferCommands: false
+    };
+
+    console.log('🔄 Connecting to MongoDB...');
+    await mongoose.connect(connectionString, options);
+    cachedConnection = mongoose.connection;
+    cachedModels = createModels(cachedConnection);
+    console.log('✅ Database connection established');
+    
+    return cachedConnection;
+  } catch (error) {
+    console.error('❌ MongoDB connection failed:', error.message);
+    cachedConnection = null;
+    cachedModels = createModels(null);
+    return null;
+  }
+};
+
+// ==================== SCHEMA DEFINITIONS ====================
 
 const createModels = (connection) => {
-  console.log('🔧 Creating enhanced models...');
-  
+  if (!connection) {
+    console.log('⚠️ Creating mock models (no DB connection)');
+    return {
+      Product: { find: () => Promise.resolve([]), findOne: () => Promise.resolve(null), findById: () => Promise.resolve(null), findByIdAndUpdate: () => Promise.resolve(null), findByIdAndDelete: () => Promise.resolve(null), countDocuments: () => Promise.resolve(0), deleteMany: () => Promise.resolve({ deletedCount: 0 }), updateMany: () => Promise.resolve({ modifiedCount: 0 }) },
+      Shop: { find: () => Promise.resolve([]), findOne: () => Promise.resolve(null), findById: () => Promise.resolve(null), findByIdAndUpdate: () => Promise.resolve(null), findByIdAndDelete: () => Promise.resolve(null), countDocuments: () => Promise.resolve(0), deleteMany: () => Promise.resolve({ deletedCount: 0 }), updateMany: () => Promise.resolve({ modifiedCount: 0 }), aggregate: () => Promise.resolve([]) },
+      Cashier: { find: () => Promise.resolve([]), findOne: () => Promise.resolve(null), findById: () => Promise.resolve(null), findByIdAndUpdate: () => Promise.resolve(null), findByIdAndDelete: () => Promise.resolve(null), countDocuments: () => Promise.resolve(0), deleteMany: () => Promise.resolve({ deletedCount: 0 }), updateMany: () => Promise.resolve({ modifiedCount: 0 }) },
+      Expense: { find: () => Promise.resolve([]), findOne: () => Promise.resolve(null), findById: () => Promise.resolve(null), findByIdAndUpdate: () => Promise.resolve(null), findByIdAndDelete: () => Promise.resolve(null), countDocuments: () => Promise.resolve(0), deleteMany: () => Promise.resolve({ deletedCount: 0 }), updateMany: () => Promise.resolve({ modifiedCount: 0 }) },
+      Transaction: { find: () => Promise.resolve([]), findOne: () => Promise.resolve(null), findById: () => Promise.resolve(null), findByIdAndUpdate: () => Promise.resolve(null), findByIdAndDelete: () => Promise.resolve(null), countDocuments: () => Promise.resolve(0), deleteMany: () => Promise.resolve({ deletedCount: 0 }), updateMany: () => Promise.resolve({ modifiedCount: 0 }), aggregate: () => Promise.resolve([]) },
+      User: { find: () => Promise.resolve([]), findOne: () => Promise.resolve(null), findById: () => Promise.resolve(null), findByIdAndUpdate: () => Promise.resolve(null), countDocuments: () => Promise.resolve(0) },
+      SecureCode: { findOne: () => Promise.resolve(null), findOneAndUpdate: () => Promise.resolve(null), deleteOne: () => Promise.resolve({ deletedCount: 0 }) },
+      TokenBlacklist: { findOne: () => Promise.resolve(null), findOneAndUpdate: () => Promise.resolve(null), save: () => Promise.resolve({}) },
+      CashierSession: { findOneAndUpdate: () => Promise.resolve(null), find: () => Promise.resolve([]) },
+      AuditLog: { save: () => Promise.resolve({}) },
+      CashierAnalytics: { findOne: () => Promise.resolve(null), deleteMany: () => Promise.resolve({ deletedCount: 0 }) }
+    };
+  }
+
+  // Product Schema (BARCODE REMOVED)
   const productSchema = new mongoose.Schema({
     name: { type: String, required: true },
     category: { type: String, default: 'Uncategorized' },
@@ -26,11 +230,6 @@ const createModels = (connection) => {
     minSellingPrice: { type: Number, default: 0 },
     currentStock: { type: Number, default: 0 },
     minStockLevel: { type: Number, default: 5 },
-    barcode: { type: String, index: true },
-    barcodeType: { type: String, default: 'INTERNAL' },
-    barcodeGenerated: { type: Boolean, default: false },
-    barcodePrinted: { type: Boolean, default: false },
-    lastPrintedAt: Date,
     shop: { type: mongoose.Schema.Types.ObjectId, ref: 'Shop' },
     shopId: String,
     shopName: String,
@@ -40,6 +239,7 @@ const createModels = (connection) => {
     updatedAt: { type: Date, default: Date.now }
   });
 
+  // Shop Schema
   const shopSchema = new mongoose.Schema({
     name: { type: String, required: true },
     location: String,
@@ -52,6 +252,7 @@ const createModels = (connection) => {
     updatedAt: { type: Date, default: Date.now }
   });
 
+  // Cashier Schema
   const cashierSchema = new mongoose.Schema({
     name: { type: String, required: true },
     email: { type: String, required: true, unique: true },
@@ -68,6 +269,7 @@ const createModels = (connection) => {
     updatedAt: { type: Date, default: Date.now }
   });
 
+  // Expense Schema
   const expenseSchema = new mongoose.Schema({
     description: { type: String, required: true },
     amount: { type: Number, required: true },
@@ -85,7 +287,7 @@ const createModels = (connection) => {
     updatedAt: { type: Date, default: Date.now }
   });
 
-  // UPDATED TRANSACTION SCHEMA WITH BARCODE SUPPORT
+  // Transaction Schema (BARCODE REMOVED)
   const transactionSchema = new mongoose.Schema({
     transactionNumber: { type: String, required: true, unique: true },
     totalAmount: { type: Number, required: true },
@@ -95,7 +297,6 @@ const createModels = (connection) => {
     items: [{
       productName: String,
       productId: { type: mongoose.Schema.Types.ObjectId, ref: 'Product' },
-      barcode: String,
       quantity: { type: Number, default: 1 },
       price: Number,
       totalPrice: Number,
@@ -106,6 +307,13 @@ const createModels = (connection) => {
     }],
     itemsCount: { type: Number, default: 0 },
     paymentMethod: { type: String, default: 'cash' },
+    paymentMethodDetailed: {
+      cash: { type: Number, default: 0 },
+      mpesa: { type: Number, default: 0 },
+      bank: { type: Number, default: 0 },
+      mpesa_bank: { type: Number, default: 0 },
+      card: { type: Number, default: 0 }
+    },
     customerName: { type: String, default: 'Walk-in Customer' },
     customerPhone: String,
     cashierName: String,
@@ -115,17 +323,16 @@ const createModels = (connection) => {
     shopName: String,
     saleDate: { type: Date, default: Date.now },
     status: { type: String, default: 'completed' },
-    
     paymentSplit: {
       cash: { type: Number, default: 0 },
-      bank_mpesa: { type: Number, default: 0 }
+      mpesa_bank: { type: Number, default: 0 }
     },
-    
     receiptNumber: String,
     createdAt: { type: Date, default: Date.now },
     updatedAt: { type: Date, default: Date.now }
   });
 
+  // User Schema
   const userSchema = new mongoose.Schema({
     email: { type: String, required: true, unique: true },
     name: { type: String, required: true },
@@ -140,6 +347,7 @@ const createModels = (connection) => {
     updatedAt: { type: Date, default: Date.now }
   });
 
+  // Secure Code Schema
   const secureCodeSchema = new mongoose.Schema({
     email: { type: String, required: true },
     code: { type: String, required: true },
@@ -148,6 +356,7 @@ const createModels = (connection) => {
     used: { type: Boolean, default: false }
   });
 
+  // Token Blacklist Schema
   const tokenBlacklistSchema = new mongoose.Schema({
     token: { type: String, required: true, unique: true },
     expiresAt: { type: Date, required: true },
@@ -156,6 +365,7 @@ const createModels = (connection) => {
     createdAt: { type: Date, default: Date.now }
   });
 
+  // Cashier Session Schema
   const cashierSessionSchema = new mongoose.Schema({
     cashierId: { type: mongoose.Schema.Types.ObjectId, ref: 'Cashier', required: true },
     token: { type: String, required: true },
@@ -167,6 +377,7 @@ const createModels = (connection) => {
     status: { type: String, default: 'active' }
   });
 
+  // Audit Log Schema
   const auditLogSchema = new mongoose.Schema({
     action: { type: String, required: true },
     userId: mongoose.Schema.Types.ObjectId,
@@ -180,24 +391,64 @@ const createModels = (connection) => {
     timestamp: { type: Date, default: Date.now }
   });
 
-  // Indexes for performance
+  // Cashier Analytics Schema
+  const cashierAnalyticsSchema = new mongoose.Schema({
+    cashierId: { type: mongoose.Schema.Types.ObjectId, ref: 'Cashier', required: true, index: true },
+    period: { type: String, required: true },
+    startDate: { type: Date, required: true },
+    endDate: { type: Date, required: true },
+    metrics: {
+      totalRevenue: { type: Number, default: 0 },
+      totalCost: { type: Number, default: 0 },
+      totalProfit: { type: Number, default: 0 },
+      totalTransactions: { type: Number, default: 0 },
+      totalItemsSold: { type: Number, default: 0 },
+      profitMargin: { type: Number, default: 0 },
+      performanceScore: { type: Number, default: 0 },
+      averageTransactionValue: { type: Number, default: 0 },
+      paymentMethods: {
+        cash: { type: Number, default: 0 },
+        mpesa_bank: { type: Number, default: 0 }
+      },
+      digitalPaymentRatio: { type: Number, default: 0 },
+      cashPaymentRatio: { type: Number, default: 0 }
+    },
+    dailyBreakdown: [{
+      date: Date,
+      revenue: Number,
+      transactions: Number,
+      profit: Number,
+      cash: Number,
+      mpesa_bank: Number
+    }],
+    topProducts: [{
+      productName: String,
+      productId: { type: mongoose.Schema.Types.ObjectId, ref: 'Product' },
+      quantitySold: Number,
+      revenue: Number,
+      profit: Number
+    }],
+    createdAt: { type: Date, default: Date.now },
+    updatedAt: { type: Date, default: Date.now }
+  });
+
+  // Indexes
   secureCodeSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
   tokenBlacklistSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
   cashierSessionSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
   cashierSessionSchema.index({ cashierId: 1 });
   auditLogSchema.index({ timestamp: -1 });
   auditLogSchema.index({ userId: 1, timestamp: -1 });
-  
+  cashierAnalyticsSchema.index({ cashierId: 1, period: 1, startDate: -1, endDate: -1 });
   transactionSchema.index({ saleDate: -1 });
   transactionSchema.index({ shop: 1 });
   transactionSchema.index({ cashierId: 1 });
   transactionSchema.index({ status: 1 });
   productSchema.index({ isActive: 1 });
   productSchema.index({ shop: 1 });
-  productSchema.index({ barcode: 1 });
-  productSchema.index({ shop: 1, barcode: 1 }, { unique: true });
+  productSchema.index({ name: 1, shop: 1 });
 
-  const models = {
+  return {
     Product: connection.models.Product || connection.model('Product', productSchema),
     Shop: connection.models.Shop || connection.model('Shop', shopSchema),
     Cashier: connection.models.Cashier || connection.model('Cashier', cashierSchema),
@@ -207,55 +458,28 @@ const createModels = (connection) => {
     SecureCode: connection.models.SecureCode || connection.model('SecureCode', secureCodeSchema),
     TokenBlacklist: connection.models.TokenBlacklist || connection.model('TokenBlacklist', tokenBlacklistSchema),
     CashierSession: connection.models.CashierSession || connection.model('CashierSession', cashierSessionSchema),
-    AuditLog: connection.models.AuditLog || connection.model('AuditLog', auditLogSchema)
+    AuditLog: connection.models.AuditLog || connection.model('AuditLog', auditLogSchema),
+    CashierAnalytics: connection.models.CashierAnalytics || connection.model('CashierAnalytics', cashierAnalyticsSchema)
   };
-
-  console.log('✅ All enhanced models created successfully');
-  return models;
 };
 
-// ==================== DATABASE CONNECTION MANAGER ====================
+// ==================== DATABASE MIDDLEWARE ====================
 
-let cachedConnection = null;
-let cachedModels = null;
-
-const connectDB = async () => {
-  if (cachedConnection && cachedConnection.readyState === 1) {
-    console.log('🔗 Using cached database connection');
-    return cachedConnection;
-  }
-
+app.use(async (req, res, next) => {
   try {
-    const connectionString = process.env.MONGODB_URI || 'mongodb+srv://kinyuastanzo6759_db_user:Y9P9gdROuewvBmq8@cluster0.4rtcx4y.mongodb.net/?appName=Cluster0';
-    
-    console.log('🔗 Creating new database connection...');
-    
-    const options = {
-      serverSelectionTimeoutMS: 15000,
-      socketTimeoutMS: 45000,
-      maxPoolSize: 10,
-      minPoolSize: 0,
-      retryWrites: true,
-      bufferCommands: false,
-      connectTimeoutMS: 10000,
-      family: 4
-    };
-
-    if (!cachedConnection) {
-      await mongoose.connect(connectionString, options);
-      cachedConnection = mongoose.connection;
-      cachedModels = createModels(cachedConnection);
-      console.log('✅ New database connection created successfully');
+    if (!cachedModels) {
+      await connectDB();
     }
-    
-    return cachedConnection;
+    req.models = cachedModels || createModels(null);
+    next();
   } catch (error) {
-    console.error('❌ MongoDB connection failed:', error.message);
-    throw error;
+    console.error('❌ Database middleware error:', error);
+    req.models = createModels(null);
+    next();
   }
-};
+});
 
-// ==================== ENHANCED TOKEN MANAGEMENT ====================
+// ==================== TOKEN MANAGEMENT ====================
 
 const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(64).toString('hex');
 const JWT_REFRESH_SECRET = process.env.JWT_REFRESH_SECRET || crypto.randomBytes(64).toString('hex');
@@ -271,7 +495,9 @@ class TokenManager {
       {
         ...payload,
         iat: Math.floor(Date.now() / 1000),
-        jti: crypto.randomBytes(16).toString('hex')
+        jti: crypto.randomBytes(16).toString('hex'),
+        sessionId: crypto.randomBytes(16).toString('hex'),
+        lastActivity: Date.now()
       },
       secret,
       { expiresIn }
@@ -315,6 +541,53 @@ class TokenManager {
       return false;
     }
   }
+
+  static async checkSessionActivity(token) {
+    try {
+      const decoded = jwt.decode(token);
+      if (!decoded) return { valid: false, reason: 'invalid_token' };
+
+      const isBlacklisted = await this.isTokenBlacklisted(token);
+      if (isBlacklisted) return { valid: false, reason: 'blacklisted' };
+
+      const lastActivity = decoded.lastActivity || decoded.iat * 1000;
+      const inactivityPeriod = Date.now() - lastActivity;
+      const INACTIVITY_LIMIT = 60 * 60 * 1000;
+
+      if (inactivityPeriod > INACTIVITY_LIMIT) {
+        await this.blacklistToken(token, decoded.userId, 'inactivity');
+        return { valid: false, reason: 'inactivity' };
+      }
+
+      return { valid: true, decoded };
+    } catch (error) {
+      console.error('Error checking session activity:', error);
+      return { valid: false, reason: 'error' };
+    }
+  }
+
+  static updateLastActivity(token) {
+    try {
+      const decoded = jwt.decode(token);
+      if (!decoded) return null;
+
+      const newToken = jwt.sign(
+        {
+          ...decoded,
+          lastActivity: Date.now(),
+          iat: decoded.iat,
+          exp: decoded.exp
+        },
+        JWT_SECRET,
+        { expiresIn: TOKEN_EXPIRY }
+      );
+
+      return newToken;
+    } catch (error) {
+      console.error('Error updating last activity:', error);
+      return null;
+    }
+  }
 }
 
 // ==================== EMAIL TRANSPORTER ====================
@@ -324,16 +597,11 @@ let emailTransporter = null;
 const getEmailTransporter = () => {
   if (!emailTransporter) {
     try {
-      const emailUser = process.env.EMAIL_USER || 'kinyuastanzo6759@gmail.com';
-      const emailPass = process.env.EMAIL_PASSWORD || 'qavwswxnsidtuytn';
+      const emailUser = process.env.EMAIL_USER || 'stanzokinyua6759@gmail.com';
+      const emailPass = process.env.EMAIL_PASSWORD || 'amzimbywdjplkdty';
 
       console.log('📧 Configuring email transporter...');
       
-      if (!emailUser || !emailPass) {
-        console.error('❌ Email credentials not configured');
-        throw new Error('Email credentials not configured');
-      }
-
       emailTransporter = nodemailer.createTransport({
         service: 'gmail',
         host: 'smtp.gmail.com',
@@ -355,8 +623,7 @@ const getEmailTransporter = () => {
         sendMail: async (mailOptions) => {
           console.log('📧 [MOCK] Email would be sent:', {
             to: mailOptions.to,
-            subject: mailOptions.subject,
-            text: mailOptions.text?.substring(0, 100) + '...'
+            subject: mailOptions.subject
           });
           
           if (mailOptions.text && mailOptions.text.includes('secure code')) {
@@ -396,161 +663,17 @@ const auditLogger = {
       console.error('❌ Error saving audit log:', error);
     }
   },
-
   logLogin: async (user, req) => {
     await auditLogger.log('LOGIN', user, 'User', user._id, null, req);
   },
-
   logLogout: async (user, req) => {
     await auditLogger.log('LOGOUT', user, 'User', user._id, null, req);
   },
-
   logTransaction: async (user, transactionId, changes, req) => {
     await auditLogger.log('TRANSACTION_CREATE', user, 'Transaction', transactionId, changes, req);
   },
-
   logProductUpdate: async (user, productId, changes, req) => {
     await auditLogger.log('PRODUCT_UPDATE', user, 'Product', productId, changes, req);
-  }
-};
-
-// ==================== ENHANCED AUTHENTICATION MIDDLEWARE ====================
-
-const verifyToken = async (req, res, next) => {
-  try {
-    const authHeader = req.header('Authorization');
-    if (!authHeader) {
-      return res.status(401).json({ 
-        success: false,
-        message: 'No authorization token provided' 
-      });
-    }
-
-    const token = authHeader.replace('Bearer ', '');
-    
-    // Check if token is blacklisted
-    const isBlacklisted = await TokenManager.isTokenBlacklisted(token);
-    if (isBlacklisted) {
-      return res.status(401).json({ 
-        success: false,
-        message: 'Token has been revoked' 
-      });
-    }
-
-    const decoded = TokenManager.verifyToken(token);
-    if (!decoded) {
-      return res.status(401).json({ 
-        success: false,
-        message: 'Invalid or expired token' 
-      });
-    }
-
-    // Add user info to request
-    req.user = {
-      id: decoded.userId || decoded.id,
-      email: decoded.email,
-      role: decoded.role,
-      name: decoded.name,
-      shopId: decoded.shopId,
-      shopName: decoded.shopName
-    };
-
-    // Update last activity for cashier sessions
-    if (req.user.role === 'cashier') {
-      await cachedModels.CashierSession.updateOne(
-        { cashierId: req.user.id, token: token },
-        { lastActivity: new Date() }
-      );
-    }
-
-    next();
-  } catch (error) {
-    console.error('❌ Token verification error:', error);
-    res.status(401).json({ 
-      success: false,
-      message: 'Authentication failed' 
-    });
-  }
-};
-
-const authorizeRole = (...allowedRoles) => {
-  return (req, res, next) => {
-    if (!req.user) {
-      return res.status(401).json({ 
-        success: false,
-        message: 'User not authenticated' 
-      });
-    }
-
-    if (!allowedRoles.includes(req.user.role)) {
-      return res.status(403).json({ 
-        success: false,
-        message: 'Insufficient permissions' 
-      });
-    }
-
-    next();
-  };
-};
-
-// ==================== BARCODE UTILITIES ====================
-
-const BarcodeUtils = {
-  generateBarcode: (type = 'INTERNAL') => {
-    const timestamp = Date.now().toString().slice(-6);
-    const random = Math.random().toString(36).substr(2, 4).toUpperCase();
-    
-    switch(type) {
-      case 'EAN13':
-        const base = '200' + Math.floor(Math.random() * 1000000000).toString().padStart(9, '0');
-        return base + BarcodeUtils.calculateEAN13CheckDigit(base);
-      case 'UPC':
-        const upcBase = Math.floor(Math.random() * 10000000000).toString().padStart(11, '0');
-        return upcBase + BarcodeUtils.calculateUPCACheckDigit(upcBase);
-      case 'CODE128':
-        return `C128${timestamp}${random}`;
-      case 'CODE39':
-        return `C39${timestamp}${random}`;
-      default:
-        return `IN${timestamp}${random}`;
-    }
-  },
-
-  calculateEAN13CheckDigit: (code) => {
-    let sum = 0;
-    for (let i = 0; i < 12; i++) {
-      const digit = parseInt(code[i]);
-      sum += (i % 2 === 0) ? digit : digit * 3;
-    }
-    const checkDigit = (10 - (sum % 10)) % 10;
-    return checkDigit.toString();
-  },
-
-  calculateUPCACheckDigit: (code) => {
-    let sum = 0;
-    for (let i = 0; i < 11; i++) {
-      const digit = parseInt(code[i]);
-      sum += (i % 2 === 0) ? digit * 3 : digit;
-    }
-    const checkDigit = (10 - (sum % 10)) % 10;
-    return checkDigit.toString();
-  },
-
-  validateBarcode: (barcode, type = 'INTERNAL') => {
-    if (!barcode || barcode.trim() === '') return false;
-    
-    switch(type) {
-      case 'EAN13':
-        return /^\d{13}$/.test(barcode);
-      case 'UPC':
-        return /^\d{12}$/.test(barcode);
-      case 'CODE128':
-        return /^[A-Z0-9]{8,}$/.test(barcode);
-      case 'CODE39':
-        return /^[A-Z0-9\-\.\$\+\/%\s]{1,}$/.test(barcode);
-      default:
-        return /^[A-Z0-9]{8,}$/.test(barcode);
-    }
   }
 };
 
@@ -562,7 +685,6 @@ const CalculationUtils = {
     const num = Number(value);
     return isNaN(num) ? defaultValue : num;
   },
-
   formatCurrency: (amount) => {
     const value = CalculationUtils.safeNumber(amount);
     return `KES ${value.toLocaleString('en-KE', {
@@ -570,208 +692,673 @@ const CalculationUtils = {
       maximumFractionDigits: 2
     })}`;
   },
-
   calculateProfit: (revenue, cost) => {
     return CalculationUtils.safeNumber(revenue) - CalculationUtils.safeNumber(cost);
   },
-
   calculateProfitMargin: (revenue, profit) => {
     const safeRevenue = CalculationUtils.safeNumber(revenue);
     const safeProfit = CalculationUtils.safeNumber(profit);
     return safeRevenue > 0 ? (safeProfit / safeRevenue) * 100 : 0;
   },
-
   calculateCOGS: (transactions) => {
     if (!Array.isArray(transactions)) return 0;
-    
     return transactions.reduce((sum, transaction) => {
       return sum + CalculationUtils.safeNumber(transaction.cost);
     }, 0);
   },
-
   calculateRevenue: (transactions) => {
     if (!Array.isArray(transactions)) return 0;
-    
     return transactions.reduce((sum, transaction) => {
       return sum + CalculationUtils.safeNumber(transaction.totalAmount);
     }, 0);
   },
-
-  processShopData: async (transactions, expenses, products, shopId) => {
-    if (!shopId || shopId === 'all') {
-      return CalculationUtils.processAllShopsData(transactions, expenses, products);
-    }
-
-    const filteredTransactions = transactions.filter(t => 
-      t.shop === shopId || t.shopId === shopId
-    );
-    
-    const filteredExpenses = expenses.filter(e => 
-      e.shop === shopId || e.shopId === shopId
-    );
-    
-    const filteredProducts = products.filter(p => 
-      p.shop === shopId || p.shopId === shopId
-    );
-
-    return CalculationUtils.processFinancialStats(
-      filteredTransactions,
-      filteredExpenses,
-      filteredProducts,
-      shopId
-    );
-  },
-
-  processAllShopsData: async (transactions, expenses, products) => {
-    const shopStats = {};
-    
-    transactions.forEach(transaction => {
-      const shopId = transaction.shop || transaction.shopId;
-      if (!shopId) return;
-      
-      if (!shopStats[shopId]) {
-        shopStats[shopId] = {
-          shopId: shopId,
-          shopName: transaction.shopName || 'Unknown Shop',
-          transactions: [],
-          expenses: [],
-          products: []
-        };
-      }
-      
-      shopStats[shopId].transactions.push(transaction);
-    });
-    
-    expenses.forEach(expense => {
-      const shopId = expense.shop || expense.shopId;
-      if (!shopId) return;
-      
-      if (shopStats[shopId]) {
-        shopStats[shopId].expenses.push(expense);
-      }
-    });
-    
-    products.forEach(product => {
-      const shopId = product.shop || product.shopId;
-      if (!shopId) return;
-      
-      if (shopStats[shopId]) {
-        shopStats[shopId].products.push(product);
-      }
-    });
-    
-    const result = {
-      allShops: [],
-      summary: {
-        totalRevenue: 0,
-        totalExpenses: 0,
-        totalProfit: 0,
-        totalCOGS: 0
-      }
+  calculatePaymentComposition: (transactions) => {
+    const composition = {
+      cash: 0,
+      mpesa_bank: 0,
+      total: 0,
+      transactions: transactions.length,
+      cashPercentage: 0,
+      mpesaBankPercentage: 0
     };
-    
-    for (const shopId in shopStats) {
-      const shopData = shopStats[shopId];
-      const financialStats = CalculationUtils.processFinancialStats(
-        shopData.transactions,
-        shopData.expenses,
-        shopData.products,
-        shopId
-      );
-      
-      result.allShops.push({
-        shopId: shopId,
-        shopName: shopData.shopName,
-        financialStats: financialStats
-      });
-      
-      result.summary.totalRevenue += financialStats.totalRevenue;
-      result.summary.totalExpenses += financialStats.totalExpenses;
-      result.summary.totalProfit += financialStats.netProfit;
-      result.summary.totalCOGS += financialStats.costOfGoodsSold;
-    }
-    
-    return result;
-  },
-
-  processFinancialStats: (transactions, expenses, products, shopId) => {
-    const totalTransactions = transactions.length;
-    const totalRevenue = CalculationUtils.calculateRevenue(transactions);
-    const costOfGoodsSold = CalculationUtils.calculateCOGS(transactions);
-    const grossProfit = totalRevenue - costOfGoodsSold;
-    
-    const totalExpenses = expenses.reduce((sum, e) => sum + CalculationUtils.safeNumber(e.amount), 0);
-    const netProfit = grossProfit - totalExpenses;
-    
-    let totalCash = 0;
-    let totalMpesaBank = 0;
 
     transactions.forEach(transaction => {
       if (transaction.paymentSplit) {
-        totalCash += CalculationUtils.safeNumber(transaction.paymentSplit.cash);
-        totalMpesaBank += CalculationUtils.safeNumber(transaction.paymentSplit.bank_mpesa);
+        composition.cash += CalculationUtils.safeNumber(transaction.paymentSplit.cash);
+        composition.mpesa_bank += CalculationUtils.safeNumber(transaction.paymentSplit.mpesa_bank);
+      } else {
+        const amount = CalculationUtils.safeNumber(transaction.totalAmount);
+        if (transaction.paymentMethod === 'cash') {
+          composition.cash += amount;
+        } else if (['mpesa', 'bank', 'mpesa_bank', 'card'].includes(transaction.paymentMethod)) {
+          composition.mpesa_bank += amount;
+        } else {
+          composition.cash += amount;
+        }
       }
     });
 
-    const financialStats = {
-      totalSales: totalTransactions,
-      totalRevenue: totalRevenue,
-      totalExpenses: totalExpenses,
-      grossProfit: grossProfit,
-      netProfit: netProfit,
-      costOfGoodsSold: costOfGoodsSold,
-      totalMpesaBank: totalMpesaBank,
-      totalCash: totalCash,
-      profitMargin: CalculationUtils.calculateProfitMargin(totalRevenue, netProfit),
-      totalItemsSold: transactions.reduce((sum, t) => sum + t.itemsCount, 0),
-      averageTransactionValue: totalTransactions > 0 ? totalRevenue / totalTransactions : 0
-    };
+    composition.total = composition.cash + composition.mpesa_bank;
+    composition.cashPercentage = composition.total > 0 
+      ? (composition.cash / composition.total) * 100 
+      : 0;
+    composition.mpesaBankPercentage = composition.total > 0 
+      ? (composition.mpesa_bank / composition.total) * 100 
+      : 0;
 
-    return financialStats;
+    return composition;
   },
-
-  processCashierData: async (transactions, expenses, products, cashierId) => {
-    if (!cashierId || cashierId === 'all') {
+  calculatePerformanceMetrics: (transactions, type = 'cashier') => {
+    if (!Array.isArray(transactions) || transactions.length === 0) {
       return {
-        success: false,
-        message: 'Cashier ID is required'
+        totalRevenue: 0,
+        totalCost: 0,
+        totalProfit: 0,
+        totalTransactions: 0,
+        totalItemsSold: 0,
+        profitMargin: 0,
+        performanceScore: 0,
+        paymentMethods: { cash: 0, mpesa_bank: 0 },
+        digitalPaymentRatio: 0,
+        cashPaymentRatio: 0,
+        averageTransactionValue: 0,
+        totalCash: 0,
+        totalBankMpesa: 0,
+        cashPercentage: 0,
+        mpesaBankPercentage: 0
       };
     }
 
-    const filteredTransactions = transactions.filter(t => 
-      t.cashierId === cashierId || t.cashierName?.includes(cashierId)
-    );
-
-    const cashierShopId = filteredTransactions.length > 0 
-      ? (filteredTransactions[0].shop || filteredTransactions[0].shopId)
-      : null;
-
-    const filteredExpenses = cashierShopId ? 
-      expenses.filter(e => e.shop === cashierShopId || e.shopId === cashierShopId) : [];
+    const totalRevenue = transactions.reduce((sum, t) => 
+      sum + CalculationUtils.safeNumber(t.totalAmount), 0);
     
-    const filteredProducts = cashierShopId ? 
-      products.filter(p => p.shop === cashierShopId || p.shopId === cashierShopId) : [];
+    const totalCost = transactions.reduce((sum, t) => 
+      sum + CalculationUtils.safeNumber(t.cost || 0), 0);
+    
+    const totalProfit = totalRevenue - totalCost;
+    const totalTransactions = transactions.length;
+    const totalItemsSold = transactions.reduce((sum, t) => 
+      sum + CalculationUtils.safeNumber(t.itemsCount || 0), 0);
+    
+    const profitMargin = CalculationUtils.calculateProfitMargin(totalRevenue, totalProfit);
+    const averageTransactionValue = totalTransactions > 0 ? totalRevenue / totalTransactions : 0;
 
-    const financialStats = CalculationUtils.processFinancialStats(
-      filteredTransactions,
-      filteredExpenses,
-      filteredProducts,
-      cashierShopId
-    );
+    const paymentMethods = { cash: 0, mpesa_bank: 0 };
+    transactions.forEach(transaction => {
+      if (transaction.paymentSplit) {
+        paymentMethods.cash += CalculationUtils.safeNumber(transaction.paymentSplit.cash);
+        paymentMethods.mpesa_bank += CalculationUtils.safeNumber(transaction.paymentSplit.mpesa_bank);
+      } else {
+        const amount = CalculationUtils.safeNumber(transaction.totalAmount);
+        if (transaction.paymentMethod === 'cash') {
+          paymentMethods.cash += amount;
+        } else if (['mpesa', 'bank', 'mpesa_bank', 'card'].includes(transaction.paymentMethod)) {
+          paymentMethods.mpesa_bank += amount;
+        } else {
+          paymentMethods.cash += amount;
+        }
+      }
+    });
+
+    const digitalPaymentRatio = totalRevenue > 0 ? (paymentMethods.mpesa_bank / totalRevenue) * 100 : 0;
+    const cashPaymentRatio = totalRevenue > 0 ? (paymentMethods.cash / totalRevenue) * 100 : 0;
+
+    let performanceScore = 0;
+    performanceScore += Math.min(40, (totalRevenue / 10000) * 40);
+    performanceScore += Math.min(30, (totalTransactions / 50) * 30);
+    performanceScore += Math.min(15, digitalPaymentRatio * 0.15);
+    performanceScore += Math.min(15, (Math.max(0, profitMargin) / 50) * 15);
+    performanceScore = Math.round(Math.min(100, performanceScore));
 
     return {
-      cashierId: cashierId,
-      shopId: cashierShopId,
-      transactions: filteredTransactions,
-      expenses: filteredExpenses,
-      products: filteredProducts,
-      financialStats: financialStats
+      totalRevenue,
+      totalCost,
+      totalProfit,
+      totalTransactions,
+      totalItemsSold,
+      profitMargin,
+      performanceScore,
+      paymentMethods,
+      digitalPaymentRatio,
+      cashPaymentRatio,
+      averageTransactionValue,
+      totalCash: paymentMethods.cash,
+      totalBankMpesa: paymentMethods.mpesa_bank,
+      cashPercentage: cashPaymentRatio,
+      mpesaBankPercentage: digitalPaymentRatio
     };
+  },
+  generateDailyBreakdown: (transactions) => {
+    const dailyMap = new Map();
+
+    transactions.forEach(transaction => {
+      const saleDate = transaction.saleDate || transaction.createdAt;
+      const dateKey = new Date(saleDate).toISOString().split('T')[0];
+      
+      if (!dailyMap.has(dateKey)) {
+        dailyMap.set(dateKey, {
+          date: new Date(dateKey),
+          revenue: 0,
+          transactions: 0,
+          profit: 0,
+          cash: 0,
+          mpesa_bank: 0
+        });
+      }
+      
+      const dayData = dailyMap.get(dateKey);
+      dayData.revenue += CalculationUtils.safeNumber(transaction.totalAmount);
+      dayData.transactions += 1;
+      dayData.profit += CalculationUtils.safeNumber(transaction.profit || 0);
+      
+      if (transaction.paymentSplit) {
+        dayData.cash += CalculationUtils.safeNumber(transaction.paymentSplit.cash || 0);
+        dayData.mpesa_bank += CalculationUtils.safeNumber(transaction.paymentSplit.mpesa_bank || 0);
+      } else {
+        const amount = CalculationUtils.safeNumber(transaction.totalAmount);
+        if (transaction.paymentMethod === 'cash') {
+          dayData.cash += amount;
+        } else if (['mpesa', 'bank', 'mpesa_bank', 'card'].includes(transaction.paymentMethod)) {
+          dayData.mpesa_bank += amount;
+        } else {
+          dayData.cash += amount;
+        }
+      }
+    });
+
+    return Array.from(dailyMap.values()).sort((a, b) => a.date - b.date);
+  },
+  generateTopProducts: (transactions, limit = 10) => {
+    const productMap = new Map();
+
+    transactions.forEach(transaction => {
+      transaction.items?.forEach(item => {
+        const productKey = item.productId?.toString() || item.productName;
+        if (!productMap.has(productKey)) {
+          productMap.set(productKey, {
+            productName: item.productName || 'Unknown Product',
+            productId: item.productId,
+            quantitySold: 0,
+            revenue: 0,
+            profit: 0
+          });
+        }
+        
+        const productData = productMap.get(productKey);
+        productData.quantitySold += CalculationUtils.safeNumber(item.quantity || 1);
+        productData.revenue += CalculationUtils.safeNumber(item.totalPrice || 0);
+        productData.profit += CalculationUtils.safeNumber(item.profit || 0);
+      });
+    });
+
+    return Array.from(productMap.values())
+      .sort((a, b) => b.revenue - a.revenue)
+      .slice(0, limit);
   }
 };
 
-// ==================== EMAIL FUNCTIONS ====================
+// ==================== ANALYTICS SERVICE ====================
 
+class AnalyticsService {
+  static async getCashierPerformanceSummary(cashierId, params = {}) {
+    try {
+      const models = cachedModels;
+      
+      const {
+        startDate = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0],
+        endDate = new Date().toISOString().split('T')[0],
+        period = '30d'
+      } = params;
+
+      const cachedAnalytics = await models.CashierAnalytics.findOne({
+        cashierId,
+        period: period,
+        startDate: { $gte: new Date(startDate) },
+        endDate: { $lte: new Date(endDate) }
+      })
+      .populate('cashierId', 'name email shopName')
+      .lean();
+
+      let analyticsData;
+      
+      if (cachedAnalytics) {
+        console.log('📊 Using cached cashier analytics');
+        analyticsData = {
+          summary: {
+            totalRevenue: cachedAnalytics.metrics.totalRevenue,
+            totalSales: cachedAnalytics.metrics.totalTransactions,
+            totalProfit: cachedAnalytics.metrics.totalProfit,
+            profitMargin: cachedAnalytics.metrics.profitMargin,
+            performanceScore: cachedAnalytics.metrics.performanceScore,
+            totalItemsSold: cachedAnalytics.metrics.totalItemsSold,
+            totalCash: cachedAnalytics.metrics.paymentMethods?.cash || 0,
+            totalBankMpesa: cachedAnalytics.metrics.paymentMethods?.mpesa_bank || 0,
+            cashPercentage: cachedAnalytics.metrics.cashPaymentRatio,
+            mpesaBankPercentage: cachedAnalytics.metrics.digitalPaymentRatio
+          },
+          cashier: cachedAnalytics.cashierId
+        };
+      } else {
+        const today = new Date();
+        const thirtyDaysAgo = new Date(today);
+        thirtyDaysAgo.setDate(today.getDate() - 30);
+        
+        const transactions = await models.Transaction.find({
+          cashierId: cashierId,
+          status: 'completed',
+          saleDate: { $gte: thirtyDaysAgo, $lte: today }
+        }).lean();
+
+        const metrics = CalculationUtils.calculatePerformanceMetrics(transactions, 'cashier');
+        
+        analyticsData = {
+          summary: {
+            totalRevenue: metrics.totalRevenue,
+            totalSales: metrics.totalTransactions,
+            totalProfit: metrics.totalProfit,
+            profitMargin: metrics.profitMargin,
+            performanceScore: metrics.performanceScore,
+            totalItemsSold: metrics.totalItemsSold,
+            totalCash: metrics.totalCash,
+            totalBankMpesa: metrics.totalBankMpesa,
+            cashPercentage: metrics.cashPercentage,
+            mpesaBankPercentage: metrics.mpesaBankPercentage
+          },
+          cashier: await models.Cashier.findById(cashierId).lean()
+        };
+      }
+
+      return analyticsData;
+
+    } catch (error) {
+      console.error('❌ Error getting cashier performance summary:', error);
+      throw error;
+    }
+  }
+
+  static async getCashierTransactions(cashierId, params = {}) {
+    try {
+      const models = cachedModels;
+      
+      const {
+        startDate = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0],
+        endDate = new Date().toISOString().split('T')[0],
+        dataType = 'withItems'
+      } = params;
+
+      console.log(`💳 Fetching cashier transactions for: ${cashierId}`);
+
+      const transactions = await models.Transaction.find({
+        cashierId: cashierId,
+        status: 'completed',
+        saleDate: { 
+          $gte: new Date(startDate), 
+          $lte: new Date(endDate) 
+        }
+      })
+      .populate('shop', 'name')
+      .populate('cashierId', 'name email')
+      .sort({ saleDate: -1 })
+      .lean();
+
+      const cashier = await models.Cashier.findById(cashierId)
+        .populate('shopId', 'name location')
+        .lean();
+
+      if (!cashier) {
+        throw new Error('Cashier not found');
+      }
+
+      const metrics = CalculationUtils.calculatePerformanceMetrics(transactions, 'cashier');
+
+      return {
+        transactions: dataType === 'withItems' ? transactions : [],
+        salesWithProfit: transactions.map(t => ({
+          ...t,
+          profit: t.profit || 0,
+          profitMargin: t.profitMargin || 0
+        })),
+        summary: {
+          totalRevenue: metrics.totalRevenue,
+          totalSales: metrics.totalTransactions,
+          totalProfit: metrics.totalProfit,
+          netProfit: metrics.totalProfit,
+          profitMargin: metrics.profitMargin,
+          totalItemsSold: metrics.totalItemsSold,
+          performanceScore: metrics.performanceScore,
+          paymentComposition: {
+            cash: metrics.totalCash,
+            mpesa_bank: metrics.totalBankMpesa,
+            cashPercentage: metrics.cashPercentage,
+            mpesaBankPercentage: metrics.mpesaBankPercentage,
+            cashTransactions: transactions.filter(t => 
+              t.paymentMethod === 'cash' || (t.paymentSplit && t.paymentSplit.cash > 0)
+            ).length,
+            mpesaBankTransactions: transactions.filter(t => 
+              ['mpesa', 'bank', 'mpesa_bank', 'card'].includes(t.paymentMethod) ||
+              (t.paymentSplit && t.paymentSplit.mpesa_bank > 0)
+            ).length
+          },
+          dataSource: 'server'
+        },
+        cashier: {
+          _id: cashier._id,
+          name: cashier.name,
+          email: cashier.email,
+          phone: cashier.phone,
+          status: cashier.status,
+          shopId: cashier.shopId?._id,
+          shopName: cashier.shopId?.name || cashier.shopName,
+          shopLocation: cashier.shopId?.location
+        }
+      };
+
+    } catch (error) {
+      console.error('❌ Error getting cashier transactions:', error);
+      throw error;
+    }
+  }
+}
+
+// ==================== AUTH ROUTES ====================
+
+// Activity tracking endpoint
+app.post('/api/auth/activity', async (req, res) => {
+  try {
+    const token = req.header('Authorization')?.replace('Bearer ', '');
+    
+    if (!token) {
+      return res.status(400).json({
+        success: false,
+        message: 'No token provided'
+      });
+    }
+
+    const isBlacklisted = await TokenManager.isTokenBlacklisted(token);
+    if (isBlacklisted) {
+      return res.status(401).json({
+        success: false,
+        message: 'Session expired',
+        reason: 'blacklisted',
+        code: 'SESSION_EXPIRED'
+      });
+    }
+
+    const decoded = TokenManager.verifyToken(token);
+    if (!decoded) {
+      return res.status(401).json({
+        success: false,
+        message: 'Invalid token',
+        reason: 'invalid_token',
+        code: 'SESSION_EXPIRED'
+      });
+    }
+
+    const lastActivity = decoded.lastActivity || decoded.iat * 1000;
+    const inactivityPeriod = Date.now() - lastActivity;
+    const INACTIVITY_LIMIT = 60 * 60 * 1000;
+
+    if (inactivityPeriod > INACTIVITY_LIMIT) {
+      await TokenManager.blacklistToken(token, decoded.userId, 'inactivity');
+      
+      return res.status(401).json({
+        success: false,
+        message: 'Session expired due to inactivity',
+        reason: 'inactivity',
+        code: 'SESSION_EXPIRED'
+      });
+    }
+
+    if (decoded.role === 'cashier' && req.models && req.models.CashierSession) {
+      try {
+        await req.models.CashierSession.findOneAndUpdate(
+          { cashierId: decoded.userId, status: 'active' },
+          { lastActivity: new Date() }
+        );
+      } catch (sessionError) {
+        console.error('Error updating session:', sessionError);
+      }
+    }
+
+    const newToken = TokenManager.generateToken({
+      userId: decoded.userId,
+      email: decoded.email,
+      role: decoded.role,
+      name: decoded.name,
+      lastActivity: Date.now()
+    });
+
+    res.json({
+      success: true,
+      message: 'Activity recorded',
+      token: newToken
+    });
+
+  } catch (error) {
+    console.error('❌ Activity tracking error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to record activity'
+    });
+  }
+});
+
+// Validate session endpoint
+app.post('/api/auth/validate-session', async (req, res) => {
+  try {
+    const token = req.header('Authorization')?.replace('Bearer ', '');
+    
+    if (!token) {
+      return res.status(401).json({
+        success: false,
+        message: 'No token provided',
+        code: 'NO_TOKEN'
+      });
+    }
+
+    const isBlacklisted = await TokenManager.isTokenBlacklisted(token);
+    if (isBlacklisted) {
+      return res.status(401).json({
+        success: false,
+        message: 'Session has been terminated',
+        reason: 'blacklisted',
+        code: 'SESSION_EXPIRED'
+      });
+    }
+
+    const decoded = TokenManager.verifyToken(token);
+    if (!decoded) {
+      return res.status(401).json({
+        success: false,
+        message: 'Invalid or expired token',
+        reason: 'invalid_token',
+        code: 'SESSION_EXPIRED'
+      });
+    }
+
+    const lastActivity = decoded.lastActivity || decoded.iat * 1000;
+    const inactivityPeriod = Date.now() - lastActivity;
+    const INACTIVITY_LIMIT = 60 * 60 * 1000;
+
+    if (inactivityPeriod > INACTIVITY_LIMIT) {
+      await TokenManager.blacklistToken(token, decoded.userId, 'inactivity');
+      
+      return res.status(401).json({
+        success: false,
+        message: 'Session expired due to inactivity',
+        reason: 'inactivity',
+        code: 'SESSION_EXPIRED'
+      });
+    }
+
+    let user = null;
+    
+    if (!req.models) {
+      req.models = createModels(null);
+    }
+    
+    try {
+      if (decoded.role === 'admin') {
+        user = await req.models.User?.findById(decoded.userId);
+      } else if (decoded.role === 'cashier') {
+        user = await req.models.Cashier?.findById(decoded.userId);
+      }
+    } catch (dbError) {
+      console.error('Database error in validate-session:', dbError);
+    }
+
+    if (!user) {
+      return res.json({
+        success: true,
+        message: 'Session is valid (offline mode)',
+        user: {
+          id: decoded.userId,
+          email: decoded.email,
+          name: decoded.name || decoded.email,
+          role: decoded.role,
+          status: 'active'
+        },
+        offlineMode: true
+      });
+    }
+
+    let userStatus = 'active';
+    if (user) {
+      userStatus = user.status || (user.isActive !== undefined ? (user.isActive ? 'active' : 'inactive') : 'active');
+    }
+    
+    if (userStatus !== 'active') {
+      return res.status(401).json({
+        success: false,
+        message: 'User account is inactive',
+        reason: 'inactive_account',
+        code: 'SESSION_EXPIRED'
+      });
+    }
+
+    res.json({
+      success: true,
+      message: 'Session is valid',
+      user: {
+        id: user._id || decoded.userId,
+        email: user.email || decoded.email,
+        name: user.name || decoded.name || decoded.email,
+        role: user.role || decoded.role,
+        status: userStatus
+      }
+    });
+
+  } catch (error) {
+    console.error('❌ Session validation error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to validate session',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+// Logout
+app.post('/api/auth/logout', async (req, res) => {
+  try {
+    const token = req.header('Authorization')?.replace('Bearer ', '');
+    
+    if (token) {
+      const decoded = jwt.decode(token);
+      
+      if (decoded?.userId && req.models?.CashierSession) {
+        await TokenManager.blacklistToken(token, decoded.userId, 'logout');
+        
+        await req.models.CashierSession.findOneAndUpdate(
+          { cashierId: decoded.userId, token: token },
+          { status: 'logged_out' }
+        );
+      }
+    }
+
+    res.json({
+      success: true,
+      message: 'Logged out successfully'
+    });
+  } catch (error) {
+    console.error('Logout error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Logout failed'
+    });
+  }
+});
+
+// Get active sessions
+app.get('/api/auth/sessions', async (req, res) => {
+  try {
+    const { userId } = req.query;
+    
+    if (!userId) {
+      return res.status(400).json({
+        success: false,
+        message: 'User ID required'
+      });
+    }
+
+    const sessions = await req.models.CashierSession.find({
+      cashierId: userId,
+      status: 'active'
+    }).sort({ loggedInAt: -1 });
+
+    res.json({
+      success: true,
+      data: sessions
+    });
+  } catch (error) {
+    console.error('Get sessions error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to get sessions'
+    });
+  }
+});
+
+// Terminate session
+app.post('/api/auth/sessions/terminate', async (req, res) => {
+  try {
+    const { token, userId } = req.body;
+    
+    if (!token) {
+      return res.status(400).json({
+        success: false,
+        message: 'Token required'
+      });
+    }
+
+    await TokenManager.blacklistToken(token, userId, 'terminated');
+
+    if (req.models?.CashierSession) {
+      await req.models.CashierSession.findOneAndUpdate(
+        { token: token },
+        { status: 'terminated' }
+      );
+    }
+
+    res.json({
+      success: true,
+      message: 'Session terminated successfully'
+    });
+  } catch (error) {
+    console.error('Terminate session error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to terminate session'
+    });
+  }
+});
+
+// Generate secure code helper
+const generateSecureCode = () => {
+  return Math.floor(100000 + Math.random() * 900000).toString();
+};
+
+// Send secure code email
 const sendSecureCodeEmail = async (email, secureCode) => {
   try {
     const transporter = getEmailTransporter();
@@ -781,7 +1368,7 @@ const sendSecureCodeEmail = async (email, secureCode) => {
     const mailOptions = {
       from: {
         name: 'Stanzo Shop Management',
-        address: process.env.EMAIL_USER || 'kinyuastanzo6759@gmail.com'
+        address: process.env.EMAIL_USER || 'stanzokinyua6759@gmail.com'
       },
       to: email,
       subject: 'Your Secure Login Code - Stanzo Shop Management',
@@ -813,189 +1400,7 @@ const sendSecureCodeEmail = async (email, secureCode) => {
   }
 };
 
-// ==================== TRANSACTION DATA FETCHING ====================
-
-const getAllTransactionData = async (models, filters = {}) => {
-  try {
-    const {
-      startDate,
-      endDate,
-      shopId,
-      cashierId,
-      paymentMethod,
-      status
-    } = filters;
-
-    console.log('📊 Fetching transaction data with filters:', filters);
-
-    let transactionFilter = { 
-      status: { $in: ['completed'] }
-    };
-
-    let expenseFilter = {};
-    let productFilter = {};
-
-    if (startDate && endDate) {
-      const start = new Date(startDate);
-      const end = new Date(endDate);
-      start.setHours(0, 0, 0, 0);
-      end.setHours(23, 59, 59, 999);
-      
-      transactionFilter.saleDate = { $gte: start, $lte: end };
-      expenseFilter.date = { $gte: start, $lte: end };
-    }
-
-    if (shopId && shopId !== 'all') {
-      transactionFilter.$or = [
-        { shop: shopId },
-        { shopId: shopId }
-      ];
-      expenseFilter.$or = [
-        { shop: shopId },
-        { shopId: shopId }
-      ];
-      productFilter.$or = [
-        { shop: shopId },
-        { shopId: shopId }
-      ];
-    }
-
-    if (cashierId && cashierId !== 'all') {
-      transactionFilter.$or = [
-        ...(transactionFilter.$or || []),
-        { cashierId: cashierId },
-        { cashierName: { $regex: cashierId, $options: 'i' } }
-      ];
-    }
-
-    if (paymentMethod && paymentMethod !== 'all') {
-      if (paymentMethod === 'digital') {
-        transactionFilter.paymentMethod = { $in: ['mpesa', 'bank', 'card'] };
-      } else {
-        transactionFilter.paymentMethod = paymentMethod;
-      }
-    }
-
-    const [transactions, shops, cashiers, products, expenses] = await Promise.all([
-      models.Transaction.find(transactionFilter)
-        .populate('shop', 'name location type')
-        .populate('cashierId', 'name email')
-        .sort({ saleDate: -1 })
-        .lean(),
-      models.Shop.find().lean(),
-      models.Cashier.find().lean(),
-      models.Product.find(productFilter).lean(),
-      models.Expense.find(expenseFilter).populate('shop', 'name').lean()
-    ]);
-
-    console.log(`✅ Transaction data fetched: ${transactions.length} transactions`);
-
-    return {
-      transactions,
-      shops,
-      cashiers,
-      products,
-      expenses
-    };
-
-  } catch (error) {
-    console.error('❌ Error in getAllTransactionData:', error);
-    throw error;
-  }
-};
-
-// ==================== MIDDLEWARE SETUP ====================
-
-const allowedOrigins = [
-  'https://front1-beta.vercel.app',
-  'http://localhost:3000',
-  'http://localhost:3001',
-  'http://localhost:5173'
-];
-
-const corsOptions = {
-  origin: function (origin, callback) {
-    if (!origin || allowedOrigins.indexOf(origin) !== -1) {
-      callback(null, true);
-    } else {
-      console.log(`❌ CORS blocked for origin: ${origin}`);
-      callback(new Error('Not allowed by CORS'));
-    }
-  },
-  credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept'],
-  exposedHeaders: ['Content-Range', 'X-Content-Range'],
-  maxAge: 86400
-};
-
-app.use(cors(corsOptions));
-app.options('*', cors(corsOptions));
-
-app.use(helmet({
-  contentSecurityPolicy: false,
-  crossOriginEmbedderPolicy: false,
-  crossOriginResourcePolicy: { policy: "cross-origin" }
-}));
-
-app.use((req, res, next) => {
-  res.removeHeader('X-Powered-By');
-  next();
-});
-
-app.use(compression());
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true, limit: '10mb' }));
-
-// Rate limiting
-const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 1000,
-  message: { success: false, message: 'Too many requests' }
-});
-app.use('/api/', limiter);
-
-const authLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 5,
-  message: { success: false, message: 'Too many authentication attempts' }
-});
-
-const emailLimiter = rateLimit({
-  windowMs: 60 * 60 * 1000,
-  max: 5,
-  message: { success: false, message: 'Too many email requests' }
-});
-
-app.use('/api/auth/request-code', emailLimiter);
-app.use('/api/auth/verify-code', authLimiter);
-
-app.use(morgan('dev'));
-
-// ==================== DATABASE MIDDLEWARE ====================
-
-app.use(async (req, res, next) => {
-  try {
-    const connection = await connectDB();
-    req.dbConnection = connection;
-    req.models = cachedModels;
-    next();
-  } catch (error) {
-    console.error('❌ Database connection middleware error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Database connection failed'
-    });
-  }
-});
-
-// ==================== ENHANCED AUTHENTICATION ENDPOINTS ====================
-
-const generateSecureCode = () => {
-  return Math.floor(100000 + Math.random() * 900000).toString();
-};
-
-// Admin secure code authentication
+// Request secure code
 app.post('/api/auth/request-code',
   [
     body('email').isEmail().normalizeEmail()
@@ -1058,9 +1463,8 @@ app.post('/api/auth/request-code',
         
         return res.json({
           success: true,
-          message: 'Secure code generated (email service disabled)',
+          message: 'Secure code generated (check console for development)',
           developmentMode: true,
-          secureCode: secureCode,
           expiresIn: 15
         });
       }
@@ -1082,6 +1486,7 @@ app.post('/api/auth/request-code',
   }
 );
 
+// Verify secure code
 app.post('/api/auth/verify-code',
   [
     body('email').isEmail().normalizeEmail(),
@@ -1161,7 +1566,6 @@ app.post('/api/auth/verify-code',
       user.loginCount = (user.loginCount || 0) + 1;
       await user.save();
 
-      // Generate tokens
       const tokenPayload = {
         userId: user._id,
         email: user.email,
@@ -1186,7 +1590,6 @@ app.post('/api/auth/verify-code',
         userData.shopName = user.shopName;
       }
 
-      // Log login activity
       await auditLogger.logLogin(user, req);
 
       console.log('✅ Secure code verification successful for:', email);
@@ -1209,33 +1612,46 @@ app.post('/api/auth/verify-code',
   }
 );
 
-// Enhanced cashier login with token management
+// Cashier login
 app.post('/api/auth/cashier/login', async (req, res) => {
   try {
     console.log('🔐 Cashier login attempt:', { 
-      email: req.body?.email,
+      body: req.body,
       timestamp: new Date().toISOString() 
     });
 
-    const { email, password, deviceInfo } = req.body;
     const { models } = req;
+    
+    const { email, password } = req.body;
+    
+    console.log('📝 Login credentials received:', { 
+      email: email || 'not provided',
+      hasPassword: !!password 
+    });
 
-    if (!email || !password) {
+    if (!email) {
       return res.status(400).json({
         success: false,
-        message: 'Email and password are required'
+        message: 'Email is required'
+      });
+    }
+
+    if (!password) {
+      return res.status(400).json({
+        success: false,
+        message: 'Password is required'
       });
     }
 
     const normalizedEmail = email.toLowerCase().trim();
-    console.log('🔍 Searching for cashier:', normalizedEmail);
+    console.log('🔍 Searching for cashier with email:', normalizedEmail);
 
     const cashier = await models.Cashier.findOne({ 
       email: normalizedEmail 
     }).populate('shopId', 'name location');
 
     if (!cashier) {
-      console.log('❌ Cashier not found:', normalizedEmail);
+      console.log('❌ Cashier not found with email:', normalizedEmail);
       return res.status(404).json({
         success: false,
         message: 'Cashier account not found'
@@ -1246,7 +1662,8 @@ app.post('/api/auth/cashier/login', async (req, res) => {
       id: cashier._id,
       name: cashier.name,
       email: cashier.email,
-      status: cashier.status
+      status: cashier.status,
+      shop: cashier.shopName
     });
 
     if (cashier.status !== 'active') {
@@ -1257,8 +1674,6 @@ app.post('/api/auth/cashier/login', async (req, res) => {
       });
     }
 
-    let isPasswordValid = false;
-
     if (!cashier.password) {
       console.log('❌ Cashier has no password stored');
       return res.status(401).json({
@@ -1267,30 +1682,25 @@ app.post('/api/auth/cashier/login', async (req, res) => {
       });
     }
 
+    let isPasswordValid = false;
     const hashedPassword = cashier.password;
-    const bcryptVersion = hashedPassword.substring(0, 4);
 
-    if (['$2a$', '$2b$', '$2y$'].some(prefix => hashedPassword.startsWith(prefix))) {
-      console.log(`🔑 Using bcrypt verification (${bcryptVersion})`);
+    if (hashedPassword.startsWith('$2a$') || hashedPassword.startsWith('$2b$') || hashedPassword.startsWith('$2y$')) {
+      console.log('🔑 Using bcrypt verification');
       
       try {
         isPasswordValid = await bcrypt.compare(password, hashedPassword);
         console.log('🔑 Bcrypt comparison result:', isPasswordValid);
-        
-        if (!isPasswordValid && process.env.NODE_ENV === 'development') {
-          console.log('🔍 Development fallback: checking direct match');
-          isPasswordValid = (hashedPassword === password);
-        }
       } catch (bcryptError) {
         console.error('❌ Bcrypt comparison error:', bcryptError);
-        isPasswordValid = (hashedPassword === password);
+        isPasswordValid = false;
       }
     } else {
-      console.log('🔑 Using plaintext verification');
+      console.log('🔑 Using plaintext verification (legacy)');
       isPasswordValid = (hashedPassword === password);
       
       if (isPasswordValid) {
-        console.log('🔄 Upgrading plaintext to bcrypt');
+        console.log('🔄 Upgrading plaintext password to bcrypt');
         try {
           const salt = await bcrypt.genSalt(12);
           cashier.password = await bcrypt.hash(password, salt);
@@ -1305,7 +1715,7 @@ app.post('/api/auth/cashier/login', async (req, res) => {
     console.log('🔑 Password validation result:', isPasswordValid);
 
     if (!isPasswordValid) {
-      console.log('❌ Invalid password');
+      console.log('❌ Invalid password for cashier:', normalizedEmail);
       return res.status(401).json({
         success: false,
         message: 'Invalid password. Please try again.'
@@ -1316,7 +1726,6 @@ app.post('/api/auth/cashier/login', async (req, res) => {
     cashier.loginCount = (cashier.loginCount || 0) + 1;
     await cashier.save();
 
-    // Generate tokens
     const tokenPayload = {
       userId: cashier._id,
       email: cashier.email,
@@ -1329,21 +1738,24 @@ app.post('/api/auth/cashier/login', async (req, res) => {
     const accessToken = TokenManager.generateToken(tokenPayload);
     const refreshToken = TokenManager.generateToken(tokenPayload, true);
 
-    // Create cashier session
-    const session = new models.CashierSession({
-      cashierId: cashier._id,
-      token: accessToken,
-      deviceInfo: deviceInfo || req.get('user-agent'),
-      ipAddress: req.ip || req.connection.remoteAddress,
-      expiresAt: new Date(Date.now() + 8 * 60 * 60 * 1000) // 8 hours
-    });
-    await session.save();
+    try {
+      const session = new models.CashierSession({
+        cashierId: cashier._id,
+        token: accessToken,
+        deviceInfo: req.get('user-agent'),
+        ipAddress: req.ip || req.connection.remoteAddress,
+        expiresAt: new Date(Date.now() + 8 * 60 * 60 * 1000)
+      });
+      await session.save();
+    } catch (sessionError) {
+      console.error('⚠️ Failed to create session:', sessionError);
+    }
 
     const userData = {
       _id: cashier._id,
       name: cashier.name,
       email: cashier.email,
-      phone: cashier.phone,
+      phone: cashier.phone || '',
       role: 'cashier',
       status: cashier.status,
       lastLogin: cashier.lastLogin,
@@ -1354,8 +1766,11 @@ app.post('/api/auth/cashier/login', async (req, res) => {
       createdAt: cashier.createdAt
     };
 
-    // Log login activity
-    await auditLogger.logLogin(cashier, req);
+    try {
+      await auditLogger.logLogin(cashier, req);
+    } catch (auditError) {
+      console.error('⚠️ Failed to create audit log:', auditError);
+    }
 
     console.log('✅ Login successful:', {
       id: cashier._id,
@@ -1382,7 +1797,7 @@ app.post('/api/auth/cashier/login', async (req, res) => {
   }
 });
 
-// Token refresh endpoint
+// Refresh token
 app.post('/api/auth/refresh-token', async (req, res) => {
   try {
     const { refreshToken } = req.body;
@@ -1395,7 +1810,6 @@ app.post('/api/auth/refresh-token', async (req, res) => {
       });
     }
 
-    // Verify refresh token
     const decoded = TokenManager.verifyToken(refreshToken, true);
     if (!decoded) {
       return res.status(401).json({
@@ -1404,7 +1818,6 @@ app.post('/api/auth/refresh-token', async (req, res) => {
       });
     }
 
-    // Check if user exists
     const user = await models.User.findById(decoded.userId) || 
                  await models.Cashier.findById(decoded.userId);
 
@@ -1415,7 +1828,6 @@ app.post('/api/auth/refresh-token', async (req, res) => {
       });
     }
 
-    // Generate new tokens
     const tokenPayload = {
       userId: user._id,
       email: user.email,
@@ -1428,7 +1840,6 @@ app.post('/api/auth/refresh-token', async (req, res) => {
     const newAccessToken = TokenManager.generateToken(tokenPayload);
     const newRefreshToken = TokenManager.generateToken(tokenPayload, true);
 
-    // Update cashier session if applicable
     if (user.role === 'cashier') {
       await models.CashierSession.findOneAndUpdate(
         { cashierId: user._id, token: req.headers.authorization?.replace('Bearer ', '') },
@@ -1456,111 +1867,506 @@ app.post('/api/auth/refresh-token', async (req, res) => {
   }
 });
 
-// Logout endpoint with token blacklisting
-app.post('/api/auth/logout', verifyToken, async (req, res) => {
+// ==================== CASHIER ROUTES ====================
+
+// Get all cashiers
+app.get('/api/cashiers', async (req, res) => {
   try {
-    const token = req.header('Authorization')?.replace('Bearer ', '');
     const { models } = req;
-
-    if (token) {
-      // Blacklist the token
-      await TokenManager.blacklistToken(token, req.user.id, 'logout');
-
-      // Update cashier session if applicable
-      if (req.user.role === 'cashier') {
-        await models.CashierSession.findOneAndUpdate(
-          { cashierId: req.user.id, token: token },
-          { status: 'logged_out' }
-        );
-
-        // Update cashier last logout time
-        await models.Cashier.findByIdAndUpdate(req.user.id, {
-          lastLogout: new Date()
-        });
-      }
+    const { shopId, status, search, page = 1, limit = 20, withMetrics = 'false' } = req.query;
+    
+    console.log('📋 Fetching cashiers...', { shopId, status, search, page, limit, withMetrics });
+    
+    let filter = {};
+    
+    if (shopId && shopId !== 'all') {
+      filter.$or = [
+        { shopId: shopId },
+        { shopName: { $regex: shopId, $options: 'i' } }
+      ];
+    }
+    
+    if (status && status !== 'all') {
+      filter.status = status;
+    }
+    
+    if (search) {
+      filter.$or = [
+        { name: { $regex: search, $options: 'i' } },
+        { email: { $regex: search, $options: 'i' } },
+        { phone: { $regex: search, $options: 'i' } }
+      ];
     }
 
-    // Log logout activity
-    await auditLogger.logLogout(req.user, req);
+    const skip = (parseInt(page) - 1) * parseInt(limit);
 
+    const [cashiers, total] = await Promise.all([
+      models.Cashier.find(filter)
+        .populate('shopId', 'name location')
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(parseInt(limit))
+        .lean(),
+      models.Cashier.countDocuments(filter)
+    ]);
+    
+    console.log(`✅ Found ${cashiers.length} cashiers (total: ${total})`);
+    
+    let enhancedCashiers = cashiers;
+    if (withMetrics === 'true') {
+      const today = new Date();
+      const thirtyDaysAgo = new Date(today);
+      thirtyDaysAgo.setDate(today.getDate() - 30);
+      
+      enhancedCashiers = await Promise.all(cashiers.map(async (cashier) => {
+        try {
+          const transactions = await models.Transaction.find({
+            cashierId: cashier._id,
+            status: 'completed',
+            saleDate: { $gte: thirtyDaysAgo, $lte: today }
+          }).lean();
+          
+          const metrics = CalculationUtils.calculatePerformanceMetrics(transactions, 'cashier');
+          
+          return {
+            ...cashier,
+            metrics: {
+              totalTransactions: metrics.totalTransactions,
+              totalRevenue: metrics.totalRevenue,
+              totalProfit: metrics.totalProfit,
+              profitMargin: metrics.profitMargin,
+              performanceScore: metrics.performanceScore,
+              last30Days: {
+                transactions: metrics.totalTransactions,
+                revenue: metrics.totalRevenue,
+                profit: metrics.totalProfit
+              }
+            }
+          };
+        } catch (error) {
+          console.error(`❌ Error calculating metrics for cashier ${cashier._id}:`, error);
+          return {
+            ...cashier,
+            metrics: {
+              totalTransactions: 0,
+              totalRevenue: 0,
+              totalProfit: 0,
+              profitMargin: 0,
+              performanceScore: 0,
+              last30Days: {
+                transactions: 0,
+                revenue: 0,
+                profit: 0
+              }
+            }
+          };
+        }
+      }));
+    }
+    
     res.json({
       success: true,
-      message: 'Logged out successfully'
+      data: enhancedCashiers,
+      count: enhancedCashiers.length,
+      total,
+      page: parseInt(page),
+      totalPages: Math.ceil(total / parseInt(limit)),
+      message: 'Cashiers fetched successfully',
+      ...(withMetrics === 'true' ? { withMetrics: true } : {})
     });
-
   } catch (error) {
-    console.error('❌ Logout error:', error);
+    console.error('❌ Error fetching cashiers:', error);
     res.status(500).json({
       success: false,
-      message: 'Failed to logout'
+      message: 'Failed to fetch cashiers',
+      error: error.message
     });
   }
 });
 
-// Validate token endpoint
-app.get('/api/auth/validate', verifyToken, async (req, res) => {
+// Get cashier performance data
+app.get('/api/cashiers/:id/performance', async (req, res) => {
   try {
+    const { id } = req.params;
+    const { 
+      startDate, 
+      endDate, 
+      period = 'daily',
+      dataType = 'withItems' 
+    } = req.query;
     const { models } = req;
 
-    let user;
-    if (req.user.role === 'cashier') {
-      user = await models.Cashier.findById(req.user.id)
-        .populate('shopId', 'name location');
-    } else {
-      user = await models.User.findById(req.user.id);
-    }
+    console.log('📈 Fetching cashier performance...', { 
+      id, 
+      startDate, 
+      endDate, 
+      period, 
+      dataType 
+    });
 
-    if (!user) {
+    const cashier = await models.Cashier.findById(id)
+      .populate('shopId', 'name location')
+      .lean();
+    
+    if (!cashier) {
       return res.status(404).json({
         success: false,
-        message: 'User not found'
+        message: 'Cashier not found'
       });
     }
 
-    const userData = {
-      _id: user._id,
-      name: user.name,
-      email: user.email,
-      role: user.role,
-      lastLogin: user.lastLogin
+    const today = new Date();
+    let start = new Date(today);
+    let end = today;
+    
+    if (startDate && endDate) {
+      start = new Date(startDate);
+      end = new Date(endDate);
+    } else {
+      switch(period) {
+        case 'daily':
+          start.setDate(start.getDate() - 1);
+          break;
+        case 'weekly':
+          start.setDate(start.getDate() - 7);
+          break;
+        case 'monthly':
+          start.setMonth(start.getMonth() - 1);
+          break;
+        case 'annually':
+          start.setFullYear(start.getFullYear() - 1);
+          break;
+        default:
+          start.setDate(start.getDate() - 1);
+      }
+    }
+    
+    start.setHours(0, 0, 0, 0);
+    end.setHours(23, 59, 59, 999);
+
+    const transactions = await models.Transaction.find({
+      cashierId: id,
+      status: 'completed',
+      saleDate: { $gte: start, $lte: end }
+    })
+    .populate('shop', 'name')
+    .populate('cashierId', 'name email')
+    .sort({ saleDate: -1 })
+    .lean();
+
+    const metrics = CalculationUtils.calculatePerformanceMetrics(transactions, 'cashier');
+    const dailyBreakdown = CalculationUtils.generateDailyBreakdown(transactions);
+    const topProducts = CalculationUtils.generateTopProducts(transactions, 10);
+
+    const response = {
+      success: true,
+      data: {
+        cashier: {
+          _id: cashier._id,
+          name: cashier.name,
+          email: cashier.email,
+          phone: cashier.phone,
+          status: cashier.status,
+          shopId: cashier.shopId?._id,
+          shopName: cashier.shopId?.name || cashier.shopName,
+          shopLocation: cashier.shopId?.location,
+          lastLogin: cashier.lastLogin,
+          loginCount: cashier.loginCount,
+          createdAt: cashier.createdAt,
+          updatedAt: cashier.updatedAt
+        },
+        
+        summary: {
+          totalRevenue: metrics.totalRevenue,
+          totalSales: metrics.totalTransactions,
+          totalProfit: metrics.totalProfit,
+          netProfit: metrics.totalProfit,
+          profitMargin: metrics.profitMargin,
+          totalItemsSold: metrics.totalItemsSold,
+          performanceScore: metrics.performanceScore,
+          totalCost: metrics.totalCost,
+          
+          paymentComposition: {
+            cash: metrics.totalCash,
+            mpesa_bank: metrics.totalBankMpesa,
+            total: metrics.totalCash + metrics.totalBankMpesa,
+            cashPercentage: metrics.cashPercentage,
+            mpesaBankPercentage: metrics.mpesaBankPercentage,
+            cashTransactions: transactions.filter(t => 
+              t.paymentMethod === 'cash' || (t.paymentSplit && t.paymentSplit.cash > 0)
+            ).length,
+            mpesaBankTransactions: transactions.filter(t => 
+              ['mpesa', 'bank', 'mpesa_bank', 'card'].includes(t.paymentMethod) ||
+              (t.paymentSplit && t.paymentSplit.mpesa_bank > 0)
+            ).length
+          },
+          
+          averageTransactionValue: metrics.averageTransactionValue,
+          digitalPaymentRatio: metrics.digitalPaymentRatio,
+          dataSource: 'server'
+        },
+        
+        transactions: dataType === 'withItems' ? transactions : [],
+        salesWithProfit: transactions.map(t => ({
+          ...t,
+          profit: t.profit || 0,
+          profitMargin: t.profitMargin || 0
+        })),
+        filteredTransactions: transactions,
+        
+        dailyPerformance: dailyBreakdown,
+        topProducts: topProducts,
+        recentTransactions: transactions.slice(0, 20),
+        
+        period: {
+          start: start.toISOString().split('T')[0],
+          end: end.toISOString().split('T')[0],
+          period: period
+        }
+      },
+      message: 'Cashier performance data fetched successfully'
     };
 
-    if (user.role === 'cashier') {
-      userData.shopId = user.shopId?._id;
-      userData.shopName = user.shopId?.name || user.shopName;
-      userData.shopLocation = user.shopId?.location;
-    }
-
-    res.json({
-      success: true,
-      user: userData,
-      message: 'Token is valid'
-    });
+    res.json(response);
 
   } catch (error) {
-    console.error('❌ Token validation error:', error);
+    console.error('❌ Error fetching cashier performance:', error);
     res.status(500).json({
       success: false,
-      message: 'Token validation failed'
+      message: 'Failed to fetch cashier performance data',
+      error: error.message
     });
   }
 });
 
-// ==================== PROTECTED TRANSACTION ENDPOINTS ====================
+// Create cashier
+app.post('/api/cashiers', async (req, res) => {
+  try {
+    const { models } = req;
+    const cashierData = req.body;
+    
+    console.log('🆕 Creating cashier...', { 
+      name: cashierData.name,
+      email: cashierData.email 
+    });
 
-// Create transaction with enhanced payment split tracking
-app.post('/api/transactions', verifyToken, authorizeRole('cashier', 'admin'), async (req, res) => {
+    const existingCashier = await models.Cashier.findOne({ 
+      email: cashierData.email.toLowerCase().trim() 
+    });
+    
+    if (existingCashier) {
+      return res.status(409).json({
+        success: false,
+        message: 'Cashier with this email already exists'
+      });
+    }
+    
+    if (cashierData.password) {
+      const salt = await bcrypt.genSalt(12);
+      cashierData.password = await bcrypt.hash(cashierData.password, salt);
+    }
+    
+    cashierData.role = 'cashier';
+    cashierData.status = cashierData.status || 'active';
+    cashierData.email = cashierData.email.toLowerCase().trim();
+    
+    if (cashierData.shopId) {
+      const shop = await models.Shop.findById(cashierData.shopId);
+      if (shop) {
+        cashierData.shopName = shop.name;
+      }
+    }
+
+    const cashier = new models.Cashier(cashierData);
+    await cashier.save();
+    
+    await cashier.populate('shopId', 'name location');
+    
+    console.log('✅ Cashier created:', cashier._id);
+    
+    res.status(201).json({
+      success: true,
+      data: cashier,
+      message: 'Cashier created successfully'
+    });
+  } catch (error) {
+    console.error('❌ Error creating cashier:', error);
+    
+    if (error.code === 11000 && error.keyPattern?.email) {
+      return res.status(409).json({
+        success: false,
+        message: 'Cashier with this email already exists'
+      });
+    }
+    
+    res.status(500).json({
+      success: false,
+      message: 'Failed to create cashier',
+      error: error.message
+    });
+  }
+});
+
+// Update cashier
+app.put('/api/cashiers/:id', async (req, res) => {
+  try {
+    const { models } = req;
+    const { id } = req.params;
+    const cashierData = req.body;
+    
+    console.log('✏️ Updating cashier...', id);
+
+    const existingCashier = await models.Cashier.findById(id);
+    if (!existingCashier) {
+      return res.status(404).json({
+        success: false,
+        message: 'Cashier not found'
+      });
+    }
+    
+    if (cashierData.email && cashierData.email !== existingCashier.email) {
+      const emailExists = await models.Cashier.findOne({ 
+        email: cashierData.email.toLowerCase().trim(),
+        _id: { $ne: id }
+      });
+      
+      if (emailExists) {
+        return res.status(409).json({
+          success: false,
+          message: 'Cashier with this email already exists'
+        });
+      }
+      cashierData.email = cashierData.email.toLowerCase().trim();
+    }
+    
+    if (cashierData.password && cashierData.password !== '') {
+      const salt = await bcrypt.genSalt(12);
+      cashierData.password = await bcrypt.hash(cashierData.password, salt);
+    } else {
+      delete cashierData.password;
+    }
+    
+    if (cashierData.shopId) {
+      const shop = await models.Shop.findById(cashierData.shopId);
+      if (shop) {
+        cashierData.shopName = shop.name;
+      }
+    }
+
+    const updatedCashier = await models.Cashier.findByIdAndUpdate(
+      id,
+      { ...cashierData, updatedAt: new Date() },
+      { new: true, runValidators: true }
+    ).populate('shopId', 'name location');
+    
+    console.log('✅ Cashier updated:', id);
+    
+    res.json({
+      success: true,
+      data: updatedCashier,
+      message: 'Cashier updated successfully'
+    });
+  } catch (error) {
+    console.error('❌ Error updating cashier:', error);
+    
+    if (error.code === 11000 && error.keyPattern?.email) {
+      return res.status(409).json({
+        success: false,
+        message: 'Cashier with this email already exists'
+      });
+    }
+    
+    res.status(500).json({
+      success: false,
+      message: 'Failed to update cashier',
+      error: error.message
+    });
+  }
+});
+
+// Delete cashier
+app.delete('/api/cashiers/:id', async (req, res) => {
+  try {
+    const { models } = req;
+    const { id } = req.params;
+    
+    console.log('🗑️ Deleting cashier...', id);
+
+    const cashier = await models.Cashier.findByIdAndDelete(id);
+    
+    if (!cashier) {
+      return res.status(404).json({
+        success: false,
+        message: 'Cashier not found'
+      });
+    }
+    
+    console.log('✅ Cashier deleted:', id);
+    
+    res.json({
+      success: true,
+      data: cashier,
+      message: 'Cashier deleted successfully'
+    });
+  } catch (error) {
+    console.error('❌ Error deleting cashier:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to delete cashier',
+      error: error.message
+    });
+  }
+});
+
+// Get cashier by ID
+app.get('/api/cashiers/:id', async (req, res) => {
+  try {
+    const { models } = req;
+    const { id } = req.params;
+    
+    console.log('🔍 Getting cashier by ID...', id);
+
+    const cashier = await models.Cashier.findById(id)
+      .populate('shopId', 'name location')
+      .lean();
+    
+    if (!cashier) {
+      return res.status(404).json({
+        success: false,
+        message: 'Cashier not found'
+      });
+    }
+    
+    console.log('✅ Cashier found:', id);
+    
+    res.json({
+      success: true,
+      data: cashier,
+      message: 'Cashier fetched successfully'
+    });
+  } catch (error) {
+    console.error('❌ Error fetching cashier:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch cashier',
+      error: error.message
+    });
+  }
+});
+
+// ==================== TRANSACTION ROUTES ====================
+
+// Create transaction (BARCODE REMOVED)
+app.post('/api/transactions', async (req, res) => {
   try {
     const { models } = req;
     const transactionData = req.body;
     
     console.log('💳 Creating transaction:', {
       paymentMethod: transactionData.paymentMethod,
-      totalAmount: transactionData.totalAmount,
-      cashier: req.user.name
+      totalAmount: transactionData.totalAmount
     });
 
-    // Validate payment split for cash+bank/mpesa
     if (transactionData.paymentMethod === 'cash_bank_mpesa') {
       const cashAmount = CalculationUtils.safeNumber(transactionData.cashAmount);
       const bankMpesaAmount = CalculationUtils.safeNumber(transactionData.bankMpesaAmount);
@@ -1596,10 +2402,6 @@ app.post('/api/transactions', verifyToken, authorizeRole('cashier', 'admin'), as
       }
     }
 
-    // Use authenticated cashier info
-    transactionData.cashierId = req.user.id;
-    transactionData.cashierName = req.user.name;
-
     const items = transactionData.items || [];
     let totalAmount = 0;
     let totalCost = 0;
@@ -1616,20 +2418,6 @@ app.post('/api/transactions', verifyToken, authorizeRole('cashier', 'admin'), as
       totalAmount += itemTotalPrice;
       totalCost += itemCost;
 
-      // Get product barcode if available
-      let barcode = item.barcode;
-      if (!barcode && item.productId) {
-        try {
-          const product = await models.Product.findById(item.productId);
-          if (product && product.barcode) {
-            barcode = product.barcode;
-          }
-        } catch (error) {
-          console.error('❌ Error fetching product barcode:', error);
-        }
-      }
-
-      // Update stock
       if (item.productId) {
         try {
           const product = await models.Product.findById(item.productId);
@@ -1657,8 +2445,7 @@ app.post('/api/transactions', verifyToken, authorizeRole('cashier', 'admin'), as
         buyingPrice,
         cost: itemCost,
         profit: itemProfit,
-        profitMargin: itemProfitMargin,
-        barcode: barcode
+        profitMargin: itemProfitMargin
       };
     }));
 
@@ -1672,20 +2459,33 @@ app.post('/api/transactions', verifyToken, authorizeRole('cashier', 'admin'), as
     transactionData.itemsCount = items.reduce((sum, item) => sum + CalculationUtils.safeNumber(item.quantity, 1), 0);
     transactionData.items = enhancedItems;
 
-    // Enhanced payment split calculation
     transactionData.paymentSplit = {
       cash: 0,
-      bank_mpesa: 0
+      mpesa_bank: 0
+    };
+
+    transactionData.paymentMethodDetailed = {
+      cash: 0,
+      mpesa: 0,
+      bank: 0,
+      mpesa_bank: 0,
+      card: 0
     };
 
     if (transactionData.paymentMethod === 'cash') {
       transactionData.paymentSplit.cash = totalAmount;
-    } else if (['mpesa', 'bank', 'card', 'bank_mpesa'].includes(transactionData.paymentMethod)) {
-      transactionData.paymentSplit.bank_mpesa = totalAmount;
-    } else if (transactionData.paymentMethod === 'cash_bank_mpesa') {
-      // For split payments
-      transactionData.paymentSplit.cash = CalculationUtils.safeNumber(transactionData.cashAmount);
-      transactionData.paymentSplit.bank_mpesa = CalculationUtils.safeNumber(transactionData.bankMpesaAmount);
+      transactionData.paymentMethodDetailed.cash = totalAmount;
+    } else if (transactionData.paymentMethod === 'mpesa_bank') {
+      transactionData.paymentSplit.mpesa_bank = totalAmount;
+      transactionData.paymentMethodDetailed.mpesa_bank = totalAmount;
+    } else if (transactionData.paymentMethod === 'cash_mpesa_bank') {
+      const cashAmount = CalculationUtils.safeNumber(transactionData.cashAmount);
+      const mpesaBankAmount = CalculationUtils.safeNumber(transactionData.mpesaBankAmount);
+      
+      transactionData.paymentSplit.cash = cashAmount;
+      transactionData.paymentSplit.mpesa_bank = mpesaBankAmount;
+      transactionData.paymentMethodDetailed.cash = cashAmount;
+      transactionData.paymentMethodDetailed.mpesa_bank = mpesaBankAmount;
     }
 
     if (!transactionData.transactionNumber) {
@@ -1702,19 +2502,21 @@ app.post('/api/transactions', verifyToken, authorizeRole('cashier', 'admin'), as
     await transaction.populate('shop', 'name location type');
     await transaction.populate('cashierId', 'name email');
 
-    // Log transaction creation
-    await auditLogger.logTransaction(req.user, transaction._id, {
-      totalAmount: transaction.totalAmount,
-      paymentMethod: transaction.paymentMethod,
-      paymentSplit: transaction.paymentSplit,
-      itemsCount: transaction.itemsCount
-    }, req);
+    if (transaction.cashierId) {
+      try {
+        await models.CashierAnalytics.deleteMany({ cashierId: transaction.cashierId });
+        console.log('🔄 Invalidated analytics cache for cashier:', transaction.cashierId);
+      } catch (cacheError) {
+        console.error('❌ Error invalidating analytics cache:', cacheError);
+      }
+    }
 
     console.log('✅ Transaction created:', {
       transactionId: transaction._id,
       totalAmount: totalAmount,
       profit: profit,
-      paymentSplit: transaction.paymentSplit
+      paymentSplit: transaction.paymentSplit,
+      paymentMethodDetailed: transaction.paymentMethodDetailed
     });
 
     res.status(201).json({
@@ -1732,8 +2534,8 @@ app.post('/api/transactions', verifyToken, authorizeRole('cashier', 'admin'), as
   }
 });
 
-// Get combined transactions with payment split data
-app.get('/api/transactions/combined', verifyToken, async (req, res) => {
+// Unified transactions endpoint
+app.get('/api/transactions/combined', async (req, res) => {
   try {
     const {
       startDate,
@@ -1741,7 +2543,7 @@ app.get('/api/transactions/combined', verifyToken, async (req, res) => {
       shopId,
       cashierId,
       paymentMethod,
-      dataType = 'all'
+      dataType = 'withItems'
     } = req.query;
 
     const { models } = req;
@@ -1750,79 +2552,128 @@ app.get('/api/transactions/combined', verifyToken, async (req, res) => {
 
     const startTime = Date.now();
     
-    const filters = {
-      startDate,
-      endDate,
-      shopId,
-      cashierId,
-      paymentMethod
-    };
+    let filter = { status: 'completed' };
 
-    const transactionData = await getAllTransactionData(models, filters);
-    
-    // Process data with shop isolation
-    let processedData;
-    if (shopId && shopId !== 'all') {
-      const shopData = await CalculationUtils.processShopData(
-        transactionData.transactions,
-        transactionData.expenses,
-        transactionData.products,
-        shopId
-      );
-      
-      processedData = {
-        salesWithProfit: transactionData.transactions,
-        financialStats: shopData,
-        expenses: transactionData.expenses,
-        products: transactionData.products,
-        shops: transactionData.shops,
-        cashiers: transactionData.cashiers,
-        summary: shopData,
-        timestamp: new Date().toISOString()
-      };
-    } else {
-      // Process all shops data
-      const allShopsData = await CalculationUtils.processAllShopsData(
-        transactionData.transactions,
-        transactionData.expenses,
-        transactionData.products
-      );
-      
-      processedData = {
-        salesWithProfit: transactionData.transactions,
-        financialStats: allShopsData.summary,
-        expenses: transactionData.expenses,
-        products: transactionData.products,
-        shops: transactionData.shops,
-        cashiers: transactionData.cashiers,
-        summary: allShopsData.summary,
-        allShopsData: allShopsData.allShops,
-        timestamp: new Date().toISOString()
-      };
+    if (startDate && endDate) {
+      const start = new Date(startDate);
+      const end = new Date(endDate);
+      start.setHours(0, 0, 0, 0);
+      end.setHours(23, 59, 59, 999);
+      filter.saleDate = { $gte: start, $lte: end };
     }
 
-    // Calculate payment composition totals
-    const paymentComposition = {
-      cash: 0,
-      bank_mpesa: 0,
-      total: 0
+    if (shopId && shopId !== 'all') {
+      filter.$or = [
+        { shop: shopId },
+        { shopId: shopId }
+      ];
+    }
+
+    if (cashierId && cashierId !== 'all') {
+      filter.cashierId = cashierId;
+      console.log('👤 Filtering by cashierId:', cashierId);
+    }
+
+    if (paymentMethod && paymentMethod !== 'all') {
+      if (paymentMethod === 'digital') {
+        filter.$or = [
+          { paymentMethod: 'mpesa' },
+          { paymentMethod: 'bank' },
+          { paymentMethod: 'card' },
+          { paymentMethod: 'mpesa_bank' }
+        ];
+      } else {
+        filter.paymentMethod = paymentMethod;
+      }
+    }
+
+    const [transactions, shops, cashiers, products, expenses] = await Promise.all([
+      models.Transaction.find(filter)
+        .populate('shop', 'name location type')
+        .populate('cashierId', 'name email shopName')
+        .sort({ saleDate: -1 })
+        .lean(),
+      models.Shop.find().lean(),
+      models.Cashier.find().lean(),
+      models.Product.find({}).lean(),
+      models.Expense.find({}).populate('shop', 'name').lean()
+    ]);
+
+    console.log(`📊 Found ${transactions.length} transactions`);
+    
+    let specificCashier = null;
+    if (cashierId && cashierId !== 'all') {
+      specificCashier = await models.Cashier.findById(cashierId)
+        .populate('shopId', 'name location')
+        .lean();
+    }
+
+    const totalTransactions = transactions.length;
+    const totalRevenue = CalculationUtils.calculateRevenue(transactions);
+    const costOfGoodsSold = CalculationUtils.calculateCOGS(transactions);
+    const grossProfit = totalRevenue - costOfGoodsSold;
+    const netProfit = grossProfit;
+    
+    const paymentComposition = CalculationUtils.calculatePaymentComposition(transactions);
+
+    let cashierMetrics = null;
+    if (specificCashier) {
+      cashierMetrics = CalculationUtils.calculatePerformanceMetrics(transactions, 'cashier');
+    }
+
+    const summary = {
+      totalSales: totalTransactions,
+      totalRevenue: totalRevenue,
+      totalExpenses: 0,
+      grossProfit: grossProfit,
+      netProfit: netProfit,
+      costOfGoodsSold: costOfGoodsSold,
+      totalMpesaBank: paymentComposition.mpesa_bank,
+      totalCash: paymentComposition.cash,
+      profitMargin: CalculationUtils.calculateProfitMargin(totalRevenue, netProfit),
+      totalItemsSold: transactions.reduce((sum, t) => sum + CalculationUtils.safeNumber(t.itemsCount || 0), 0),
+      averageTransactionValue: totalTransactions > 0 ? totalRevenue / totalTransactions : 0,
+      paymentComposition: paymentComposition,
+      ...(cashierMetrics ? {
+        performanceScore: cashierMetrics.performanceScore,
+        digitalPaymentRatio: cashierMetrics.digitalPaymentRatio,
+        cashPaymentRatio: cashierMetrics.cashPaymentRatio
+      } : {})
     };
 
-    transactionData.transactions.forEach(transaction => {
-      if (transaction.paymentSplit) {
-        paymentComposition.cash += CalculationUtils.safeNumber(transaction.paymentSplit.cash);
-        paymentComposition.bank_mpesa += CalculationUtils.safeNumber(transaction.paymentSplit.bank_mpesa);
-      }
-    });
-
-    paymentComposition.total = paymentComposition.cash + paymentComposition.bank_mpesa;
-
-    processedData.paymentComposition = paymentComposition;
+    const processedData = {
+      transactions: transactions,
+      salesWithProfit: transactions.map(t => ({
+        ...t,
+        profit: t.profit || 0,
+        profitMargin: t.profitMargin || 0
+      })),
+      filteredTransactions: transactions,
+      expenses: expenses,
+      products: products,
+      shops: shops,
+      cashiers: cashiers,
+      summary: summary,
+      financialStats: summary,
+      enhancedStats: {
+        salesWithProfit: transactions.map(t => ({
+          ...t,
+          profit: t.profit || 0,
+          profitMargin: t.profitMargin || 0
+        })),
+        financialStats: summary
+      },
+      paymentComposition: paymentComposition,
+      ...(specificCashier ? {
+        cashier: specificCashier,
+        cashierMetrics: cashierMetrics
+      } : {})
+    };
 
     const processingTime = Date.now() - startTime;
 
     console.log(`✅ Combined transaction data generated in ${processingTime}ms`);
-    console.log('💰 Payment Composition:', paymentComposition);
+    console.log(`📊 Summary: ${totalTransactions} transactions, KES ${totalRevenue.toFixed(2)} revenue`);
 
     res.json({
       success: true,
@@ -1842,405 +2693,92 @@ app.get('/api/transactions/combined', verifyToken, async (req, res) => {
   }
 });
 
-// Cashier-specific data endpoint with payment composition
-app.get('/api/cashier/data/:cashierId', verifyToken, async (req, res) => {
+// Transaction metrics
+app.get('/api/transactions/metrics', async (req, res) => {
   try {
-    const { cashierId } = req.params;
-    const { startDate, endDate } = req.query;
+    const { startDate, endDate, shopId } = req.query;
     const { models } = req;
 
-    console.log('👤 Fetching cashier-specific data:', { cashierId, startDate, endDate });
+    console.log('📈 Fetching transaction metrics...', { startDate, endDate, shopId });
 
-    const filters = {
-      startDate,
-      endDate,
-      cashierId
-    };
+    let filter = { status: 'completed' };
 
-    const transactionData = await getAllTransactionData(models, filters);
-    
-    // Process cashier-specific data
-    const cashierData = await CalculationUtils.processCashierData(
-      transactionData.transactions,
-      transactionData.expenses,
-      transactionData.products,
-      cashierId
-    );
-
-    // Calculate cashier-specific payment composition
-    const cashierPaymentComposition = {
-      cash: 0,
-      bank_mpesa: 0,
-      total: 0
-    };
-
-    transactionData.transactions.forEach(transaction => {
-      if (transaction.paymentSplit) {
-        cashierPaymentComposition.cash += CalculationUtils.safeNumber(transaction.paymentSplit.cash);
-        cashierPaymentComposition.bank_mpesa += CalculationUtils.safeNumber(transaction.paymentSplit.bank_mpesa);
-      }
-    });
-
-    cashierPaymentComposition.total = cashierPaymentComposition.cash + cashierPaymentComposition.bank_mpesa;
-
-    // Get cashier details
-    const cashier = await models.Cashier.findById(cashierId)
-      .populate('shopId', 'name location')
-      .lean();
-
-    res.json({
-      success: true,
-      data: {
-        cashier: cashier,
-        ...cashierData,
-        paymentComposition: cashierPaymentComposition
-      },
-      message: 'Cashier data fetched successfully',
-      note: 'Data includes only transactions, expenses, and products related to this cashier'
-    });
-
-  } catch (error) {
-    console.error('❌ Error fetching cashier data:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to fetch cashier data',
-      error: error.message
-    });
-  }
-});
-
-// ==================== PROTECTED PRODUCT ENDPOINTS ====================
-
-// Search product by barcode
-app.get('/api/products/search/barcode', verifyToken, async (req, res) => {
-  try {
-    const { barcode, shop } = req.query;
-    const { models } = req;
-
-    if (!barcode) {
-      return res.status(400).json({
-        success: false,
-        message: 'Barcode is required'
-      });
+    if (startDate && endDate) {
+      const start = new Date(startDate);
+      const end = new Date(endDate);
+      start.setHours(0, 0, 0, 0);
+      end.setHours(23, 59, 59, 999);
+      filter.saleDate = { $gte: start, $lte: end };
     }
 
-    console.log(`🔍 Searching product by barcode: ${barcode}, shop: ${shop}`);
-
-    let query = { barcode };
-    
-    if (shop && shop !== 'all') {
-      query.$or = [
-        { shop: shop },
-        { shopId: shop }
-      ];
-    }
-
-    const product = await models.Product.findOne(query)
-      .populate('shop', 'name location type')
-      .lean();
-
-    if (!product) {
-      return res.status(404).json({
-        success: false,
-        message: 'Product not found with this barcode'
-      });
-    }
-
-    res.json({
-      success: true,
-      data: product,
-      message: 'Product found successfully'
-    });
-
-  } catch (error) {
-    console.error('❌ Error searching product by barcode:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to search product',
-      error: error.message
-    });
-  }
-});
-
-// Generate barcode for a product
-app.post('/api/products/:id/generate-barcode', verifyToken, authorizeRole('admin'), async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { barcodeType = 'INTERNAL', customBarcode } = req.body;
-    const { models } = req;
-
-    console.log(`🎫 Generating barcode for product: ${id}, type: ${barcodeType}`);
-
-    const product = await models.Product.findById(id);
-    
-    if (!product) {
-      return res.status(404).json({
-        success: false,
-        message: 'Product not found'
-      });
-    }
-
-    let barcode;
-    
-    if (customBarcode && BarcodeUtils.validateBarcode(customBarcode, barcodeType)) {
-      barcode = customBarcode;
-      
-      // Check if barcode already exists in the same shop
-      const existingProduct = await models.Product.findOne({
-        _id: { $ne: id },
-        barcode: customBarcode,
-        $or: [
-          { shop: product.shop },
-          { shopId: product.shopId || product.shop }
-        ]
-      });
-      
-      if (existingProduct) {
-        return res.status(409).json({
-          success: false,
-          message: 'Barcode already exists for another product in this shop'
-        });
-      }
-    } else {
-      barcode = BarcodeUtils.generateBarcode(barcodeType);
-    }
-
-    product.barcode = barcode;
-    product.barcodeType = barcodeType;
-    product.barcodeGenerated = true;
-    product.updatedAt = new Date();
-
-    await product.save();
-
-    await product.populate('shop', 'name location type');
-
-    // Log product update
-    await auditLogger.logProductUpdate(req.user, product._id, {
-      barcode: barcode,
-      barcodeType: barcodeType
-    }, req);
-
-    res.json({
-      success: true,
-      data: {
-        barcode: product.barcode,
-        barcodeType: product.barcodeType,
-        barcodeGenerated: product.barcodeGenerated,
-        product: product
-      },
-      message: 'Barcode generated successfully'
-    });
-
-  } catch (error) {
-    console.error('❌ Error generating barcode:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to generate barcode',
-      error: error.message
-    });
-  }
-});
-
-// Bulk generate barcodes for products
-app.post('/api/products/bulk-generate-barcodes', verifyToken, authorizeRole('admin'), async (req, res) => {
-  try {
-    const { barcodeType = 'INTERNAL', productIds, shopId } = req.body;
-    const { models } = req;
-
-    console.log(`🎫 Bulk generating barcodes, type: ${barcodeType}`);
-
-    let query = { barcode: { $exists: false } };
-    
-    if (productIds && Array.isArray(productIds) && productIds.length > 0) {
-      query._id = { $in: productIds };
-    }
-    
     if (shopId && shopId !== 'all') {
-      query.$or = [
+      filter.$or = [
         { shop: shopId },
         { shopId: shopId }
       ];
     }
 
-    const products = await models.Product.find(query);
+    const transactions = await models.Transaction.find(filter);
 
-    if (products.length === 0) {
-      return res.json({
-        success: true,
-        data: {
-          processed: 0,
-          success: 0,
-          failed: 0
-        },
-        message: 'No products need barcode generation'
-      });
-    }
-
-    const results = {
-      processed: products.length,
-      success: 0,
-      failed: 0,
-      products: []
-    };
-
-    for (const product of products) {
-      try {
-        const barcode = BarcodeUtils.generateBarcode(barcodeType);
-        
-        product.barcode = barcode;
-        product.barcodeType = barcodeType;
-        product.barcodeGenerated = true;
-        product.updatedAt = new Date();
-        
-        await product.save();
-        
-        results.success++;
-        results.products.push({
-          productId: product._id,
-          name: product.name,
-          barcode: barcode,
-          barcodeType: barcodeType,
-          success: true
-        });
-      } catch (error) {
-        console.error(`❌ Failed to generate barcode for product ${product._id}:`, error);
-        results.failed++;
-        results.products.push({
-          productId: product._id,
-          name: product.name,
-          error: error.message,
-          success: false
-        });
-      }
-    }
-
-    res.json({
-      success: true,
-      data: results,
-      message: `Generated barcodes for ${results.success} products successfully, ${results.failed} failed`
-    });
-
-  } catch (error) {
-    console.error('❌ Error bulk generating barcodes:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to bulk generate barcodes',
-      error: error.message
-    });
-  }
-});
-
-// Mark barcode as printed
-app.post('/api/products/:id/mark-printed', verifyToken, authorizeRole('admin', 'cashier'), async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { models } = req;
-
-    console.log(`🏷️ Marking barcode as printed for product: ${id}`);
-
-    const product = await models.Product.findById(id);
-    
-    if (!product) {
-      return res.status(404).json({
-        success: false,
-        message: 'Product not found'
-      });
-    }
-
-    if (!product.barcode) {
-      return res.status(400).json({
-        success: false,
-        message: 'Product does not have a barcode'
-      });
-    }
-
-    product.barcodePrinted = true;
-    product.lastPrintedAt = new Date();
-    product.updatedAt = new Date();
-
-    await product.save();
-
-    res.json({
-      success: true,
-      data: {
-        barcodePrinted: product.barcodePrinted,
-        lastPrintedAt: product.lastPrintedAt,
-        product: {
-          _id: product._id,
-          name: product.name,
-          barcode: product.barcode
+    const totalTransactions = transactions.length;
+    const totalRevenue = CalculationUtils.calculateRevenue(transactions);
+    const totalExpenses = await models.Expense.aggregate([
+      {
+        $match: filter
+      },
+      {
+        $group: {
+          _id: null,
+          total: { $sum: '$amount' }
         }
-      },
-      message: 'Barcode marked as printed successfully'
-    });
-
-  } catch (error) {
-    console.error('❌ Error marking barcode as printed:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to mark barcode as printed',
-      error: error.message
-    });
-  }
-});
-
-// Get barcode statistics
-app.get('/api/products/barcode-stats', verifyToken, async (req, res) => {
-  try {
-    const { shopId } = req.query;
-    const { models } = req;
-
-    console.log(`📊 Getting barcode statistics for shop: ${shopId || 'all'}`);
-
-    let query = {};
-    
-    if (shopId && shopId !== 'all') {
-      query.$or = [
-        { shop: shopId },
-        { shopId: shopId }
-      ];
-    }
-
-    const products = await models.Product.find(query);
-    
-    const stats = {
-      totalProducts: products.length,
-      withBarcode: products.filter(p => p.barcode).length,
-      withoutBarcode: products.filter(p => !p.barcode).length,
-      barcodePrinted: products.filter(p => p.barcodePrinted).length,
-      barcodeNotPrinted: products.filter(p => p.barcode && !p.barcodePrinted).length,
-      byBarcodeType: {}
-    };
-
-    products.forEach(product => {
-      if (product.barcodeType) {
-        stats.byBarcodeType[product.barcodeType] = (stats.byBarcodeType[product.barcodeType] || 0) + 1;
       }
-    });
+    ]);
+
+    const expensesTotal = totalExpenses.length > 0 ? totalExpenses[0].total : 0;
+    const costOfGoodsSold = CalculationUtils.calculateCOGS(transactions);
+    const grossProfit = totalRevenue - costOfGoodsSold;
+    const netProfit = grossProfit - expensesTotal;
+
+    const totalCash = transactions.reduce((sum, t) => 
+      sum + CalculationUtils.safeNumber(t.paymentSplit?.cash || 0), 0);
+    
+    const totalMpesaBank = transactions.reduce((sum, t) => 
+      sum + CalculationUtils.safeNumber(t.paymentSplit?.mpesa_bank || 0), 0);
+
+    const metrics = {
+      totalSales: { amount: totalRevenue, count: totalTransactions, description: `${totalTransactions} transactions` },
+      totalRevenue: { amount: totalRevenue, description: 'From all sales' },
+      expenses: { amount: expensesTotal, description: 'Total operational costs' },
+      grossProfit: { amount: grossProfit, description: 'Revenue - Cost of Goods' },
+      netProfit: { amount: netProfit, description: 'After all expenses' },
+      costOfGoodsSold: { amount: costOfGoodsSold, description: 'For all sales' },
+      totalMpesaBank: { amount: totalMpesaBank, description: 'Digital payments (M-Pesa/Bank)' },
+      totalCash: { amount: totalCash, description: 'Cash payments' }
+    };
 
     res.json({
       success: true,
-      data: stats,
-      message: 'Barcode statistics retrieved successfully'
+      data: metrics,
+      message: 'Transaction metrics fetched successfully'
     });
 
   } catch (error) {
-    console.error('❌ Error getting barcode statistics:', error);
+    console.error('❌ Error fetching transaction metrics:', error);
     res.status(500).json({
       success: false,
-      message: 'Failed to get barcode statistics',
+      message: 'Failed to fetch transaction metrics',
       error: error.message
     });
   }
 });
 
-// ==================== PROTECTED CRUD ENDPOINTS ====================
+// ==================== PRODUCT ROUTES (BARCODE REMOVED) ====================
 
-// Products API with barcode support
-app.get('/api/products', verifyToken, async (req, res) => {
+// Get all products
+app.get('/api/products', async (req, res) => {
   try {
-    const { shopId, search, barcode, category } = req.query;
     const { models } = req;
+    const { shopId, search, category, page = 1, limit = 50 } = req.query;
     
     let filter = {};
     if (shopId && shopId !== 'all') {
@@ -2253,27 +2791,32 @@ app.get('/api/products', verifyToken, async (req, res) => {
     if (search) {
       filter.$or = [
         { name: { $regex: search, $options: 'i' } },
-        { barcode: { $regex: search, $options: 'i' } },
         { category: { $regex: search, $options: 'i' } }
       ];
-    }
-
-    if (barcode) {
-      filter.barcode = barcode;
     }
 
     if (category && category !== 'all') {
       filter.category = category;
     }
 
-    const products = await models.Product.find(filter)
-      .populate('shop', 'name location type')
-      .sort({ createdAt: -1 });
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+
+    const [products, total] = await Promise.all([
+      models.Product.find(filter)
+        .populate('shop', 'name location type')
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(parseInt(limit)),
+      models.Product.countDocuments(filter)
+    ]);
     
     res.json({
       success: true,
       data: products,
-      count: products.length
+      count: products.length,
+      total,
+      page: parseInt(page),
+      totalPages: Math.ceil(total / parseInt(limit))
     });
   } catch (error) {
     console.error('Error fetching products:', error);
@@ -2285,36 +2828,15 @@ app.get('/api/products', verifyToken, async (req, res) => {
   }
 });
 
-app.post('/api/products', verifyToken, authorizeRole('admin'), async (req, res) => {
+// Create product
+app.post('/api/products', async (req, res) => {
   try {
     const { models } = req;
     const productData = req.body;
     
     console.log('🆕 Creating product:', {
-      name: productData.name,
-      barcode: productData.barcode,
-      barcodeType: productData.barcodeType
+      name: productData.name
     });
-
-    // Check if barcode already exists in the same shop
-    if (productData.barcode) {
-      const existingProduct = await models.Product.findOne({
-        barcode: productData.barcode,
-        $or: [
-          { shop: productData.shop },
-          { shopId: productData.shopId || productData.shop }
-        ]
-      });
-      
-      if (existingProduct) {
-        return res.status(409).json({
-          success: false,
-          message: 'Barcode already exists for another product in this shop'
-        });
-      }
-      
-      productData.barcodeGenerated = true;
-    }
 
     if (productData.shop) {
       const shop = await models.Shop.findById(productData.shop);
@@ -2328,13 +2850,6 @@ app.post('/api/products', verifyToken, authorizeRole('admin'), async (req, res) 
     await product.save();
     
     await product.populate('shop', 'name location type');
-    
-    // Log product creation
-    await auditLogger.logProductUpdate(req.user, product._id, {
-      action: 'CREATE',
-      name: product.name,
-      barcode: product.barcode
-    }, req);
     
     res.status(201).json({
       success: true,
@@ -2351,13 +2866,12 @@ app.post('/api/products', verifyToken, authorizeRole('admin'), async (req, res) 
   }
 });
 
-app.put('/api/products/:id', verifyToken, authorizeRole('admin'), async (req, res) => {
+// Update product
+app.put('/api/products/:id', async (req, res) => {
   try {
     const { models } = req;
     const { id } = req.params;
     const productData = req.body;
-
-    console.log('✏️ Updating product:', id);
 
     const product = await models.Product.findById(id);
     if (!product) {
@@ -2365,27 +2879,6 @@ app.put('/api/products/:id', verifyToken, authorizeRole('admin'), async (req, re
         success: false,
         message: 'Product not found'
       });
-    }
-
-    // Check barcode uniqueness if changing barcode
-    if (productData.barcode && productData.barcode !== product.barcode) {
-      const existingProduct = await models.Product.findOne({
-        _id: { $ne: id },
-        barcode: productData.barcode,
-        $or: [
-          { shop: product.shop },
-          { shopId: product.shopId || product.shop }
-        ]
-      });
-      
-      if (existingProduct) {
-        return res.status(409).json({
-          success: false,
-          message: 'Barcode already exists for another product in this shop'
-        });
-      }
-      
-      productData.barcodeGenerated = true;
     }
 
     if (productData.shop) {
@@ -2396,19 +2889,12 @@ app.put('/api/products/:id', verifyToken, authorizeRole('admin'), async (req, re
       }
     }
 
-    const oldProduct = { ...product.toObject() };
     const updatedProduct = await models.Product.findByIdAndUpdate(
       id,
       { ...productData, updatedAt: new Date() },
       { new: true, runValidators: true }
     ).populate('shop', 'name location type');
 
-    // Log product update
-    await auditLogger.logProductUpdate(req.user, updatedProduct._id, {
-      action: 'UPDATE',
-      changes: productData
-    }, req);
-    
     res.json({
       success: true,
       data: updatedProduct,
@@ -2424,7 +2910,8 @@ app.put('/api/products/:id', verifyToken, authorizeRole('admin'), async (req, re
   }
 });
 
-app.delete('/api/products/:id', verifyToken, authorizeRole('admin'), async (req, res) => {
+// Delete product
+app.delete('/api/products/:id', async (req, res) => {
   try {
     const { models } = req;
     const { id } = req.params;
@@ -2437,12 +2924,6 @@ app.delete('/api/products/:id', verifyToken, authorizeRole('admin'), async (req,
         message: 'Product not found'
       });
     }
-
-    // Log product deletion
-    await auditLogger.log('PRODUCT_DELETE', req.user, 'Product', id, {
-      productName: product.name,
-      barcode: product.barcode
-    }, req);
     
     res.json({
       success: true,
@@ -2459,18 +2940,121 @@ app.delete('/api/products/:id', verifyToken, authorizeRole('admin'), async (req,
   }
 });
 
-// Shops API - FULL CRUD
-app.get('/api/shops', verifyToken, async (req, res) => {
+// Product stats overview
+app.get('/api/products/stats/overview', async (req, res) => {
   try {
+    const { shopId } = req.query;
     const { models } = req;
-    const shops = await models.Shop.find().sort({ createdAt: -1 });
+    
+    let filter = {};
+    if (shopId && shopId !== 'all') {
+      filter.$or = [
+        { shop: shopId },
+        { shopId: shopId }
+      ];
+    }
+
+    const products = await models.Product.find(filter);
+    
+    const totalProducts = products.length;
+    const outOfStock = products.filter(p => p.currentStock === 0).length;
+    const lowStock = products.filter(p => 
+      p.currentStock > 0 && p.currentStock <= (p.minStockLevel || 5)
+    ).length;
+    const inStock = totalProducts - outOfStock;
+
+    const totalInventoryValue = products.reduce((sum, product) => {
+      return sum + (product.currentStock * product.buyingPrice);
+    }, 0);
+
+    const totalPotentialRevenue = products.reduce((sum, product) => {
+      return sum + (product.currentStock * product.minSellingPrice);
+    }, 0);
+
+    const categories = [...new Set(products.map(p => p.category).filter(Boolean))];
+
+    const stats = {
+      overview: {
+        totalProducts,
+        outOfStock,
+        lowStock,
+        inStock,
+        totalInventoryValue,
+        totalPotentialRevenue,
+        averageStockValue: totalProducts > 0 ? totalInventoryValue / totalProducts : 0
+      },
+      categories: categories.map(category => ({
+        name: category,
+        count: products.filter(p => p.category === category).length,
+        products: products.filter(p => p.category === category).slice(0, 5)
+      })),
+      stockAnalysis: {
+        stockValueByCategory: {},
+        reorderNeeded: products.filter(p => p.currentStock <= (p.minStockLevel || 5)).length,
+        zeroStock: outOfStock
+      }
+    };
+
+    categories.forEach(category => {
+      const categoryProducts = products.filter(p => p.category === category);
+      const categoryValue = categoryProducts.reduce((sum, p) => 
+        sum + (p.currentStock * p.buyingPrice), 0
+      );
+      stats.stockAnalysis.stockValueByCategory[category] = categoryValue;
+    });
+
     res.json({
       success: true,
-      data: shops,
-      count: shops.length
+      data: stats,
+      message: 'Product statistics retrieved successfully'
+    });
+
+  } catch (error) {
+    console.error('Error fetching product stats:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch product statistics',
+      error: error.message
+    });
+  }
+});
+
+// ==================== SHOP ROUTES ====================
+
+// Get all shops
+app.get('/api/shops', async (req, res) => {
+  try {
+    const { models } = req;
+    console.log('🔍 Fetching shops from database...');
+    
+    const shops = await models.Shop.find({}).sort({ createdAt: -1 });
+    
+    console.log(`📊 Raw database results: ${shops.length} shops`);
+    
+    const seenNames = new Set();
+    const uniqueShops = [];
+    
+    shops.forEach(shop => {
+      const shopName = shop.name.trim().toLowerCase();
+      if (!seenNames.has(shopName)) {
+        seenNames.add(shopName);
+        uniqueShops.push(shop);
+      } else {
+        console.log(`⚠️ Filtering out duplicate shop by name: ${shop.name} (ID: ${shop._id})`);
+      }
+    });
+    
+    console.log(`✅ Returning ${uniqueShops.length} unique shops (from ${shops.length} total)`);
+    
+    res.json({
+      success: true,
+      data: uniqueShops,
+      count: uniqueShops.length,
+      originalCount: shops.length,
+      duplicatesRemoved: shops.length - uniqueShops.length
     });
   } catch (error) {
-    console.error('Error fetching shops:', error);
+    console.error('❌ Error fetching shops:', error);
     res.status(500).json({
       success: false,
       message: 'Failed to fetch shops',
@@ -2479,41 +3063,15 @@ app.get('/api/shops', verifyToken, async (req, res) => {
   }
 });
 
-app.post('/api/shops', verifyToken, authorizeRole('admin'), async (req, res) => {
-  try {
-    const { models } = req;
-    const shopData = req.body;
-    
-    const shop = new models.Shop(shopData);
-    await shop.save();
-    
-    res.status(201).json({
-      success: true,
-      data: shop,
-      message: 'Shop created successfully'
-    });
-  } catch (error) {
-    console.error('Error creating shop:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to create shop',
-      error: error.message
-    });
-  }
-});
-
-app.put('/api/shops/:id', verifyToken, authorizeRole('admin'), async (req, res) => {
+// Delete shop
+app.delete('/api/shops/:id', async (req, res) => {
   try {
     const { models } = req;
     const { id } = req.params;
-    const shopData = req.body;
     
-    const shop = await models.Shop.findByIdAndUpdate(
-      id,
-      { ...shopData, updatedAt: new Date() },
-      { new: true, runValidators: true }
-    );
+    console.log(`🗑️ Deleting shop ID: ${id}`);
     
+    const shop = await models.Shop.findById(id);
     if (!shop) {
       return res.status(404).json({
         success: false,
@@ -2521,39 +3079,36 @@ app.put('/api/shops/:id', verifyToken, authorizeRole('admin'), async (req, res) 
       });
     }
     
-    res.json({
-      success: true,
-      data: shop,
-      message: 'Shop updated successfully'
-    });
-  } catch (error) {
-    console.error('Error updating shop:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to update shop',
-      error: error.message
-    });
-  }
-});
-
-app.delete('/api/shops/:id', verifyToken, authorizeRole('admin'), async (req, res) => {
-  try {
-    const { models } = req;
-    const { id } = req.params;
+    const deletedShop = await models.Shop.findByIdAndDelete(id);
     
-    const shop = await models.Shop.findByIdAndDelete(id);
+    const deletePromises = [
+      models.Product.deleteMany({ shop: id }),
+      models.Transaction.deleteMany({ shop: id }),
+      models.Expense.deleteMany({ shop: id }),
+      models.Cashier.updateMany(
+        { shopId: id }, 
+        { 
+          $unset: { shopId: "", shopName: "" },
+          status: 'inactive',
+          updatedAt: new Date()
+        }
+      )
+    ];
     
-    if (!shop) {
-      return res.status(404).json({
-        success: false,
-        message: 'Shop not found'
-      });
-    }
+    await Promise.all(deletePromises);
+    
+    console.log(`✅ Shop permanently deleted: ${shop.name} (ID: ${shop._id})`);
     
     res.json({
       success: true,
-      data: shop,
-      message: 'Shop deleted successfully'
+      data: deletedShop,
+      message: 'Shop and all related data permanently deleted successfully',
+      cleanup: {
+        productsDeleted: true,
+        transactionsDeleted: true,
+        expensesDeleted: true,
+        cashiersUpdated: true
+      }
     });
   } catch (error) {
     console.error('Error deleting shop:', error);
@@ -2565,178 +3120,350 @@ app.delete('/api/shops/:id', verifyToken, authorizeRole('admin'), async (req, re
   }
 });
 
-// Cashiers API with shop isolation - FULL CRUD
-app.get('/api/cashiers', verifyToken, async (req, res) => {
-  try {
-    const { shopId } = req.query;
-    const { models } = req;
-    
-    let filter = {};
-    if (shopId && shopId !== 'all') {
-      filter.$or = [
-        { shopId: shopId },
-        { shopName: { $regex: shopId, $options: 'i' } }
-      ];
-    }
-
-    const cashiers = await models.Cashier.find(filter)
-      .populate('shopId', 'name location')
-      .sort({ createdAt: -1 });
-    
-    res.json({
-      success: true,
-      data: cashiers,
-      count: cashiers.length
-    });
-  } catch (error) {
-    console.error('Error fetching cashiers:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to fetch cashiers',
-      error: error.message
-    });
-  }
-});
-
-app.post('/api/cashiers', verifyToken, authorizeRole('admin'), async (req, res) => {
-  try {
-    const { models } = req;
-    const cashierData = req.body;
-    
-    // Hash password if provided
-    if (cashierData.password) {
-      const salt = await bcrypt.genSalt(12);
-      cashierData.password = await bcrypt.hash(cashierData.password, salt);
-    }
-    
-    if (cashierData.shopId) {
-      const shop = await models.Shop.findById(cashierData.shopId);
-      if (shop) {
-        cashierData.shopName = shop.name;
-      }
-    }
-
-    const cashier = new models.Cashier(cashierData);
-    await cashier.save();
-    
-    await cashier.populate('shopId', 'name location');
-    
-    res.status(201).json({
-      success: true,
-      data: cashier,
-      message: 'Cashier created successfully'
-    });
-  } catch (error) {
-    console.error('Error creating cashier:', error);
-    
-    // Handle duplicate email error
-    if (error.code === 11000 && error.keyPattern?.email) {
-      return res.status(409).json({
-        success: false,
-        message: 'Cashier with this email already exists'
-      });
-    }
-    
-    res.status(500).json({
-      success: false,
-      message: 'Failed to create cashier',
-      error: error.message
-    });
-  }
-});
-
-app.put('/api/cashiers/:id', verifyToken, authorizeRole('admin'), async (req, res) => {
+// Get shop by ID
+app.get('/api/shops/:id', async (req, res) => {
   try {
     const { models } = req;
     const { id } = req.params;
-    const cashierData = req.body;
     
-    // Don't update password if not provided
-    if (!cashierData.password || cashierData.password === '') {
-      delete cashierData.password;
-    } else if (cashierData.password) {
-      // Hash new password
-      const salt = await bcrypt.genSalt(12);
-      cashierData.password = await bcrypt.hash(cashierData.password, salt);
+    if (!id || !mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid shop ID'
+      });
     }
     
-    if (cashierData.shopId) {
-      const shop = await models.Shop.findById(cashierData.shopId);
-      if (shop) {
-        cashierData.shopName = shop.name;
+    console.log('🔍 Getting shop by ID...', id);
+
+    const shop = await models.Shop.findById(id).lean();
+    
+    if (!shop) {
+      return res.status(404).json({
+        success: false,
+        message: 'Shop not found'
+      });
+    }
+    
+    console.log('✅ Shop found:', id);
+    
+    res.json({
+      success: true,
+      data: shop,
+      message: 'Shop fetched successfully'
+    });
+  } catch (error) {
+    console.error('❌ Error fetching shop:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch shop',
+      error: error.message
+    });
+  }
+});
+
+// Update shop
+app.put('/api/shops/:id', async (req, res) => {
+  try {
+    const { models } = req;
+    const { id } = req.params;
+    const shopData = req.body;
+    
+    console.log('✏️ Updating shop ID:', id, 'with data:', shopData);
+
+    if (!id || !mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid shop ID'
+      });
+    }
+
+    const existingShop = await models.Shop.findById(id);
+    if (!existingShop) {
+      return res.status(404).json({
+        success: false,
+        message: 'Shop not found'
+      });
+    }
+
+    if (shopData.name && shopData.name.trim() !== existingShop.name.trim()) {
+      const normalizedName = shopData.name.trim().toLowerCase();
+      const duplicateShop = await models.Shop.findOne({
+        _id: { $ne: id },
+        name: { $regex: new RegExp(`^${normalizedName}$`, 'i') },
+        status: { $ne: 'deleted' }
+      });
+
+      if (duplicateShop) {
+        return res.status(409).json({
+          success: false,
+          message: 'Shop with this name already exists'
+        });
       }
     }
 
-    const cashier = await models.Cashier.findByIdAndUpdate(
+    const updatedShop = await models.Shop.findByIdAndUpdate(
       id,
-      { ...cashierData, updatedAt: new Date() },
+      { 
+        ...shopData, 
+        updatedAt: new Date(),
+        name: shopData.name?.trim() || existingShop.name
+      },
       { new: true, runValidators: true }
-    ).populate('shopId', 'name location');
-    
-    if (!cashier) {
-      return res.status(404).json({
-        success: false,
-        message: 'Cashier not found'
-      });
+    );
+
+    if (shopData.name && shopData.name !== existingShop.name) {
+      const updatePromises = [
+        models.Product.updateMany(
+          { shop: id },
+          { shopName: shopData.name, updatedAt: new Date() }
+        ),
+        models.Transaction.updateMany(
+          { shop: id },
+          { shopName: shopData.name, updatedAt: new Date() }
+        ),
+        models.Expense.updateMany(
+          { shop: id },
+          { shopName: shopData.name, updatedAt: new Date() }
+        ),
+        models.Cashier.updateMany(
+          { shopId: id },
+          { shopName: shopData.name, updatedAt: new Date() }
+        )
+      ];
+
+      await Promise.all(updatePromises);
+      
+      console.log(`🔄 Updated related data for shop: ${shopData.name}`);
     }
+
+    console.log('✅ Shop updated successfully:', updatedShop._id);
     
     res.json({
       success: true,
-      data: cashier,
-      message: 'Cashier updated successfully'
+      data: updatedShop,
+      message: 'Shop updated successfully'
     });
   } catch (error) {
-    console.error('Error updating cashier:', error);
+    console.error('❌ Error updating shop:', error);
     
-    // Handle duplicate email error
-    if (error.code === 11000 && error.keyPattern?.email) {
+    if (error.code === 11000) {
       return res.status(409).json({
         success: false,
-        message: 'Cashier with this email already exists'
+        message: 'Shop with this name already exists'
       });
     }
     
     res.status(500).json({
       success: false,
-      message: 'Failed to update cashier',
+      message: 'Failed to update shop',
       error: error.message
     });
   }
 });
 
-app.delete('/api/cashiers/:id', verifyToken, authorizeRole('admin'), async (req, res) => {
+// Cleanup duplicate shops
+app.post('/api/shops/cleanup-duplicates', async (req, res) => {
+  try {
+    const { models } = req;
+    
+    console.log('🧹 Cleaning up duplicate shops...');
+    
+    const allShops = await models.Shop.find({ status: { $ne: 'deleted' } }).sort({ createdAt: 1 });
+    
+    const nameMap = new Map();
+    const shopsToDelete = [];
+    const uniqueShops = [];
+    
+    allShops.forEach(shop => {
+      const normalizedName = shop.name.trim().toLowerCase();
+      
+      if (nameMap.has(normalizedName)) {
+        shopsToDelete.push(shop);
+        console.log(`❌ Marking for deletion: ${shop.name} (ID: ${shop._id}, Created: ${shop.createdAt})`);
+      } else {
+        nameMap.set(normalizedName, shop);
+        uniqueShops.push(shop);
+        console.log(`✅ Keeping shop: ${shop.name} (ID: ${shop._id}, Created: ${shop.createdAt})`);
+      }
+    });
+    
+    const deletedShops = [];
+    
+    for (const shop of shopsToDelete) {
+      try {
+        await models.Shop.findByIdAndDelete(shop._id);
+        
+        const keptShop = nameMap.get(shop.name.trim().toLowerCase());
+        
+        if (keptShop) {
+          await Promise.all([
+            models.Product.updateMany(
+              { shop: shop._id },
+              { shop: keptShop._id, shopName: keptShop.name, shopId: keptShop._id, updatedAt: new Date() }
+            ),
+            models.Transaction.updateMany(
+              { shop: shop._id },
+              { shop: keptShop._id, shopName: keptShop.name, shopId: keptShop._id, updatedAt: new Date() }
+            ),
+            models.Expense.updateMany(
+              { shop: shop._id },
+              { shop: keptShop._id, shopName: keptShop.name, shopId: keptShop._id, updatedAt: new Date() }
+            ),
+            models.Cashier.updateMany(
+              { shopId: shop._id },
+              { shopId: keptShop._id, shopName: keptShop.name, updatedAt: new Date() }
+            )
+          ]);
+        }
+        
+        deletedShops.push({
+          name: shop.name,
+          id: shop._id,
+          keptShop: keptShop ? { name: keptShop.name, id: keptShop._id } : null
+        });
+      } catch (deleteError) {
+        console.error(`❌ Error deleting shop ${shop._id}:`, deleteError);
+      }
+    }
+    
+    console.log(`✅ Cleanup complete: Deleted ${deletedShops.length} duplicate shops`);
+    
+    res.json({
+      success: true,
+      data: {
+        totalShops: allShops.length,
+        uniqueShops: uniqueShops.length,
+        deletedDuplicates: deletedShops.length,
+        shopsDeleted: deletedShops,
+        shopsKept: uniqueShops.map(s => ({ name: s.name, id: s._id }))
+      },
+      message: `Successfully cleaned up ${deletedShops.length} duplicate shops`
+    });
+  } catch (error) {
+    console.error('Error cleaning up duplicate shops:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to clean up duplicate shops',
+      error: error.message
+    });
+  }
+});
+
+// Shop stats
+app.get('/api/shops/stats', async (req, res) => {
+  try {
+    const { models } = req;
+    
+    const stats = await models.Shop.aggregate([
+      {
+        $match: { status: { $ne: 'deleted' } }
+      },
+      {
+        $group: {
+          _id: null,
+          totalShops: { $sum: 1 },
+          activeShops: {
+            $sum: { $cond: [{ $eq: ['$status', 'active'] }, 1, 0] }
+          },
+          inactiveShops: {
+            $sum: { $cond: [{ $eq: ['$status', 'inactive'] }, 1, 0] }
+          },
+          retailShops: {
+            $sum: { $cond: [{ $eq: ['$type', 'retail'] }, 1, 0] }
+          },
+          wholesaleShops: {
+            $sum: { $cond: [{ $eq: ['$type', 'wholesale'] }, 1, 0] }
+          }
+        }
+      },
+      {
+        $project: {
+          _id: 0,
+          totalShops: 1,
+          activeShops: 1,
+          inactiveShops: 1,
+          retailShops: 1,
+          wholesaleShops: 1,
+          otherShops: {
+            $subtract: [
+              '$totalShops',
+              { $add: ['$retailShops', '$wholesaleShops'] }
+            ]
+          }
+        }
+      }
+    ]);
+    
+    const defaultStats = {
+      totalShops: 0,
+      activeShops: 0,
+      inactiveShops: 0,
+      retailShops: 0,
+      wholesaleShops: 0,
+      otherShops: 0
+    };
+    
+    res.json({
+      success: true,
+      data: stats[0] || defaultStats,
+      message: 'Shop statistics retrieved successfully'
+    });
+  } catch (error) {
+    console.error('Error fetching shop stats:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch shop statistics',
+      error: error.message
+    });
+  }
+});
+
+// Soft delete shop
+app.delete('/api/shops/:id/soft', async (req, res) => {
   try {
     const { models } = req;
     const { id } = req.params;
     
-    const cashier = await models.Cashier.findByIdAndDelete(id);
+    const shop = await models.Shop.findByIdAndUpdate(
+      id,
+      { 
+        status: 'deleted',
+        deletedAt: new Date(),
+        updatedAt: new Date()
+      },
+      { new: true }
+    );
     
-    if (!cashier) {
+    if (!shop) {
       return res.status(404).json({
         success: false,
-        message: 'Cashier not found'
+        message: 'Shop not found'
       });
     }
     
+    console.log(`✅ Shop marked as deleted: ${shop.name} (ID: ${shop._id})`);
+    
     res.json({
       success: true,
-      data: cashier,
-      message: 'Cashier deleted successfully'
+      data: shop,
+      message: 'Shop marked as deleted successfully'
     });
   } catch (error) {
-    console.error('Error deleting cashier:', error);
+    console.error('Error soft deleting shop:', error);
     res.status(500).json({
       success: false,
-      message: 'Failed to delete cashier',
+      message: 'Failed to delete shop',
       error: error.message
     });
   }
 });
 
-// Expenses API with shop isolation - FULL CRUD
-app.get('/api/expenses', verifyToken, async (req, res) => {
+// ==================== EXPENSE ROUTES ====================
+
+// Get all expenses
+app.get('/api/expenses', async (req, res) => {
   try {
-    const { shopId, startDate, endDate } = req.query;
+    const { shopId, startDate, endDate, page = 1, limit = 50 } = req.query;
     const { models } = req;
     
     let filter = {};
@@ -2755,14 +3482,24 @@ app.get('/api/expenses', verifyToken, async (req, res) => {
       filter.date = { $gte: start, $lte: end };
     }
 
-    const expenses = await models.Expense.find(filter)
-      .populate('shop', 'name location')
-      .sort({ date: -1 });
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+
+    const [expenses, total] = await Promise.all([
+      models.Expense.find(filter)
+        .populate('shop', 'name location')
+        .sort({ date: -1 })
+        .skip(skip)
+        .limit(parseInt(limit)),
+      models.Expense.countDocuments(filter)
+    ]);
     
     res.json({
       success: true,
       data: expenses,
-      count: expenses.length
+      count: expenses.length,
+      total,
+      page: parseInt(page),
+      totalPages: Math.ceil(total / parseInt(limit))
     });
   } catch (error) {
     console.error('Error fetching expenses:', error);
@@ -2774,7 +3511,8 @@ app.get('/api/expenses', verifyToken, async (req, res) => {
   }
 });
 
-app.post('/api/expenses', verifyToken, authorizeRole('admin', 'cashier'), async (req, res) => {
+// Create expense
+app.post('/api/expenses', async (req, res) => {
   try {
     const { models } = req;
     const expenseData = req.body;
@@ -2807,7 +3545,8 @@ app.post('/api/expenses', verifyToken, authorizeRole('admin', 'cashier'), async 
   }
 });
 
-app.put('/api/expenses/:id', verifyToken, authorizeRole('admin', 'cashier'), async (req, res) => {
+// Update expense
+app.put('/api/expenses/:id', async (req, res) => {
   try {
     const { models } = req;
     const { id } = req.params;
@@ -2849,7 +3588,8 @@ app.put('/api/expenses/:id', verifyToken, authorizeRole('admin', 'cashier'), asy
   }
 });
 
-app.delete('/api/expenses/:id', verifyToken, authorizeRole('admin'), async (req, res) => {
+// Delete expense
+app.delete('/api/expenses/:id', async (req, res) => {
   try {
     const { models } = req;
     const { id } = req.params;
@@ -2878,12 +3618,10 @@ app.delete('/api/expenses/:id', verifyToken, authorizeRole('admin'), async (req,
   }
 });
 
-// ==================== ENHANCED ANALYTICS ENDPOINTS ====================
-
-// Get product statistics
-app.get('/api/products/stats/overview', verifyToken, async (req, res) => {
+// Expense stats overview
+app.get('/api/expenses/stats/overview', async (req, res) => {
   try {
-    const { shopId } = req.query;
+    const { shopId, startDate, endDate } = req.query;
     const { models } = req;
     
     let filter = {};
@@ -2894,463 +3632,326 @@ app.get('/api/products/stats/overview', verifyToken, async (req, res) => {
       ];
     }
 
-    const products = await models.Product.find(filter);
+    if (startDate && endDate) {
+      const start = new Date(startDate);
+      const end = new Date(endDate);
+      start.setHours(0, 0, 0, 0);
+      end.setHours(23, 59, 59, 999);
+      filter.date = { $gte: start, $lte: end };
+    }
+
+    const expenses = await models.Expense.find(filter)
+      .populate('shop', 'name')
+      .sort({ date: -1 });
+
+    const totalExpenses = expenses.length;
+    const totalAmount = expenses.reduce((sum, e) => sum + CalculationUtils.safeNumber(e.amount), 0);
+    const averageExpense = totalExpenses > 0 ? totalAmount / totalExpenses : 0;
     
-    const totalProducts = products.length;
-    const outOfStock = products.filter(p => p.currentStock === 0).length;
-    const lowStock = products.filter(p => 
-      p.currentStock > 0 && p.currentStock <= (p.minStockLevel || 5)
-    ).length;
-    const inStock = totalProducts - outOfStock;
-    const withBarcode = products.filter(p => p.barcode).length;
-    const withoutBarcode = totalProducts - withBarcode;
-    const printedBarcodes = products.filter(p => p.barcodePrinted).length;
+    const categories = [...new Set(expenses.map(e => e.category).filter(Boolean))];
+    const byCategory = categories.map(category => ({
+      category,
+      count: expenses.filter(e => e.category === category).length,
+      total: expenses.filter(e => e.category === category)
+        .reduce((sum, e) => sum + CalculationUtils.safeNumber(e.amount), 0)
+    })).sort((a, b) => b.total - a.total);
 
-    // Calculate total inventory value
-    const totalInventoryValue = products.reduce((sum, product) => {
-      return sum + (product.currentStock * product.buyingPrice);
-    }, 0);
-
-    // Calculate total potential revenue
-    const totalPotentialRevenue = products.reduce((sum, product) => {
-      return sum + (product.currentStock * product.minSellingPrice);
-    }, 0);
-
-    // Get categories
-    const categories = [...new Set(products.map(p => p.category).filter(Boolean))];
-    
-    // Get barcode types
-    const barcodeTypes = {};
-    products.forEach(product => {
-      if (product.barcodeType) {
-        barcodeTypes[product.barcodeType] = (barcodeTypes[product.barcodeType] || 0) + 1;
+    const byPaymentMethod = expenses.reduce((acc, expense) => {
+      const method = expense.paymentMethod || 'cash';
+      if (!acc[method]) {
+        acc[method] = { method, count: 0, total: 0 };
       }
-    });
+      acc[method].count += 1;
+      acc[method].total += CalculationUtils.safeNumber(expense.amount);
+      return acc;
+    }, {});
+
+    const byShop = expenses.reduce((acc, expense) => {
+      const shopName = expense.shopName || 'Unknown';
+      if (!acc[shopName]) {
+        acc[shopName] = { shopName, count: 0, total: 0 };
+      }
+      acc[shopName].count += 1;
+      acc[shopName].total += CalculationUtils.safeNumber(expense.amount);
+      return acc;
+    }, {});
 
     const stats = {
       overview: {
-        totalProducts,
-        outOfStock,
-        lowStock,
-        inStock,
-        withBarcode,
-        withoutBarcode,
-        printedBarcodes,
-        totalInventoryValue,
-        totalPotentialRevenue,
-        averageStockValue: totalProducts > 0 ? totalInventoryValue / totalProducts : 0
+        totalExpenses,
+        totalAmount,
+        averageExpense,
+        minExpense: totalExpenses > 0 ? Math.min(...expenses.map(e => CalculationUtils.safeNumber(e.amount))) : 0,
+        maxExpense: totalExpenses > 0 ? Math.max(...expenses.map(e => CalculationUtils.safeNumber(e.amount))) : 0,
+        expensesCount: totalExpenses
       },
-      categories: categories.map(category => ({
-        name: category,
-        count: products.filter(p => p.category === category).length,
-        products: products.filter(p => p.category === category).slice(0, 5)
-      })),
-      barcodeStats: {
-        byType: barcodeTypes,
-        totalWithBarcode: withBarcode,
-        totalWithoutBarcode: withoutBarcode,
-        printedVsNotPrinted: {
-          printed: printedBarcodes,
-          notPrinted: withBarcode - printedBarcodes
-        }
-      },
-      stockAnalysis: {
-        stockValueByCategory: {},
-        reorderNeeded: products.filter(p => p.currentStock <= (p.minStockLevel || 5)).length,
-        zeroStock: outOfStock
+      byCategory: Object.values(byCategory),
+      byPaymentMethod: Object.values(byPaymentMethod),
+      byShop: Object.values(byShop),
+      recentExpenses: expenses.slice(0, 10),
+      trends: {
+        daily: [],
+        weekly: [],
+        monthly: []
       }
     };
-
-    // Calculate stock value by category
-    categories.forEach(category => {
-      const categoryProducts = products.filter(p => p.category === category);
-      const categoryValue = categoryProducts.reduce((sum, p) => 
-        sum + (p.currentStock * p.buyingPrice), 0
-      );
-      stats.stockAnalysis.stockValueByCategory[category] = categoryValue;
-    });
 
     res.json({
       success: true,
       data: stats,
-      message: 'Product statistics retrieved successfully'
+      message: 'Expense statistics retrieved successfully'
     });
 
   } catch (error) {
-    console.error('Error fetching product stats:', error);
+    console.error('Error fetching expense stats:', error);
     res.status(500).json({
       success: false,
-      message: 'Failed to fetch product statistics',
+      message: 'Failed to fetch expense statistics',
       error: error.message
     });
   }
 });
 
-// Get low stock products
-app.get('/api/products/low-stock', verifyToken, async (req, res) => {
-  try {
-    const { shopId, limit = 20 } = req.query;
-    const { models } = req;
-    
-    let filter = {
-      currentStock: { $gt: 0 },
-      $expr: { $lte: ['$currentStock', '$minStockLevel'] }
-    };
-    
-    if (shopId && shopId !== 'all') {
-      filter.$or = [
-        { shop: shopId },
-        { shopId: shopId }
-      ];
-    }
+// ==================== DASHBOARD ROUTES ====================
 
-    const lowStockProducts = await models.Product.find(filter)
-      .populate('shop', 'name location type')
-      .sort({ currentStock: 1 })
-      .limit(parseInt(limit));
-
-    res.json({
-      success: true,
-      data: lowStockProducts,
-      count: lowStockProducts.length,
-      message: 'Low stock products retrieved successfully'
-    });
-
-  } catch (error) {
-    console.error('Error fetching low stock products:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to fetch low stock products',
-      error: error.message
-    });
-  }
-});
-
-// Get out of stock products
-app.get('/api/products/out-of-stock', verifyToken, async (req, res) => {
-  try {
-    const { shopId, limit = 20 } = req.query;
-    const { models } = req;
-    
-    let filter = { currentStock: 0 };
-    
-    if (shopId && shopId !== 'all') {
-      filter.$or = [
-        { shop: shopId },
-        { shopId: shopId }
-      ];
-    }
-
-    const outOfStockProducts = await models.Product.find(filter)
-      .populate('shop', 'name location type')
-      .sort({ updatedAt: -1 })
-      .limit(parseInt(limit));
-
-    res.json({
-      success: true,
-      data: outOfStockProducts,
-      count: outOfStockProducts.length,
-      message: 'Out of stock products retrieved successfully'
-    });
-
-  } catch (error) {
-    console.error('Error fetching out of stock products:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to fetch out of stock products',
-      error: error.message
-    });
-  }
-});
-
-// Get products without barcodes
-app.get('/api/products/without-barcode', verifyToken, async (req, res) => {
-  try {
-    const { shopId, limit = 50 } = req.query;
-    const { models } = req;
-    
-    let filter = { 
-      barcode: { $exists: false }
-    };
-    
-    if (shopId && shopId !== 'all') {
-      filter.$or = [
-        { shop: shopId },
-        { shopId: shopId }
-      ];
-    }
-
-    const productsWithoutBarcode = await models.Product.find(filter)
-      .populate('shop', 'name location type')
-      .sort({ createdAt: -1 })
-      .limit(parseInt(limit));
-
-    res.json({
-      success: true,
-      data: productsWithoutBarcode,
-      count: productsWithoutBarcode.length,
-      message: 'Products without barcode retrieved successfully'
-    });
-
-  } catch (error) {
-    console.error('Error fetching products without barcode:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to fetch products without barcode',
-      error: error.message
-    });
-  }
-});
-
-// ==================== PAYMENT COMPOSITION DASHBOARD ====================
-
-// Get payment composition analytics
-app.get('/api/analytics/payment-composition', verifyToken, async (req, res) => {
-  try {
-    const { startDate, endDate, shopId, cashierId } = req.query;
-    const { models } = req;
-
-    console.log('💰 Analyzing payment composition...', { startDate, endDate, shopId, cashierId });
-
-    let filter = { status: 'completed' };
-
-    if (startDate && endDate) {
-      const start = new Date(startDate);
-      const end = new Date(endDate);
-      start.setHours(0, 0, 0, 0);
-      end.setHours(23, 59, 59, 999);
-      filter.saleDate = { $gte: start, $lte: end };
-    }
-
-    if (shopId && shopId !== 'all') {
-      filter.$or = [
-        { shop: shopId },
-        { shopId: shopId }
-      ];
-    }
-
-    if (cashierId && cashierId !== 'all') {
-      filter.cashierId = cashierId;
-    }
-
-    const transactions = await models.Transaction.find(filter)
-      .populate('shop', 'name')
-      .populate('cashierId', 'name')
-      .sort({ saleDate: -1 });
-
-    // Calculate payment composition
-    const composition = {
-      cash: 0,
-      bank_mpesa: 0,
-      total: 0,
-      transactions: transactions.length,
-      byDate: {},
-      byCashier: {},
-      byShop: {}
-    };
-
-    transactions.forEach(transaction => {
-      const cashAmount = CalculationUtils.safeNumber(transaction.paymentSplit?.cash);
-      const bankMpesaAmount = CalculationUtils.safeNumber(transaction.paymentSplit?.bank_mpesa);
-      
-      composition.cash += cashAmount;
-      composition.bank_mpesa += bankMpesaAmount;
-      composition.total += cashAmount + bankMpesaAmount;
-
-      // Group by date
-      const dateStr = transaction.saleDate.toISOString().split('T')[0];
-      if (!composition.byDate[dateStr]) {
-        composition.byDate[dateStr] = { cash: 0, bank_mpesa: 0, total: 0 };
-      }
-      composition.byDate[dateStr].cash += cashAmount;
-      composition.byDate[dateStr].bank_mpesa += bankMpesaAmount;
-      composition.byDate[dateStr].total += cashAmount + bankMpesaAmount;
-
-      // Group by cashier
-      const cashierName = transaction.cashierName || 'Unknown';
-      if (!composition.byCashier[cashierName]) {
-        composition.byCashier[cashierName] = { cash: 0, bank_mpesa: 0, total: 0 };
-      }
-      composition.byCashier[cashierName].cash += cashAmount;
-      composition.byCashier[cashierName].bank_mpesa += bankMpesaAmount;
-      composition.byCashier[cashierName].total += cashAmount + bankMpesaAmount;
-
-      // Group by shop
-      const shopName = transaction.shopName || 'Unknown';
-      if (!composition.byShop[shopName]) {
-        composition.byShop[shopName] = { cash: 0, bank_mpesa: 0, total: 0 };
-      }
-      composition.byShop[shopName].cash += cashAmount;
-      composition.byShop[shopName].bank_mpesa += bankMpesaAmount;
-      composition.byShop[shopName].total += cashAmount + bankMpesaAmount;
-    });
-
-    // Calculate percentages
-    composition.cashPercentage = composition.total > 0 ? (composition.cash / composition.total) * 100 : 0;
-    composition.bankMpesaPercentage = composition.total > 0 ? (composition.bank_mpesa / composition.total) * 100 : 0;
-
-    // Convert objects to arrays for easier consumption
-    composition.byDateArray = Object.entries(composition.byDate).map(([date, data]) => ({
-      date,
-      ...data,
-      cashPercentage: data.total > 0 ? (data.cash / data.total) * 100 : 0,
-      bankMpesaPercentage: data.total > 0 ? (data.bank_mpesa / data.total) * 100 : 0
-    })).sort((a, b) => a.date.localeCompare(b.date));
-
-    composition.byCashierArray = Object.entries(composition.byCashier).map(([cashier, data]) => ({
-      cashier,
-      ...data,
-      cashPercentage: data.total > 0 ? (data.cash / data.total) * 100 : 0,
-      bankMpesaPercentage: data.total > 0 ? (data.bank_mpesa / data.total) * 100 : 0
-    })).sort((a, b) => b.total - a.total);
-
-    composition.byShopArray = Object.entries(composition.byShop).map(([shop, data]) => ({
-      shop,
-      ...data,
-      cashPercentage: data.total > 0 ? (data.cash / data.total) * 100 : 0,
-      bankMpesaPercentage: data.total > 0 ? (data.bank_mpesa / data.total) * 100 : 0
-    })).sort((a, b) => b.total - a.total);
-
-    res.json({
-      success: true,
-      data: composition,
-      message: 'Payment composition analysis completed successfully'
-    });
-
-  } catch (error) {
-    console.error('❌ Error analyzing payment composition:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to analyze payment composition',
-      error: error.message
-    });
-  }
-});
-
-// Get cashier payment performance
-app.get('/api/analytics/cashier-payment-performance', verifyToken, async (req, res) => {
+// Dashboard data
+app.get('/api/reports/dashboard', async (req, res) => {
   try {
     const { startDate, endDate, shopId } = req.query;
     const { models } = req;
 
-    let filter = { status: 'completed' };
+    console.log('📊 Fetching dashboard data...', { startDate, endDate, shopId });
 
-    if (startDate && endDate) {
-      const start = new Date(startDate);
-      const end = new Date(endDate);
-      start.setHours(0, 0, 0, 0);
-      end.setHours(23, 59, 59, 999);
-      filter.saleDate = { $gte: start, $lte: end };
-    }
+    const [transactions, shops, cashiers, products, expenses] = await Promise.all([
+      models.Transaction.find({
+        status: 'completed',
+        ...(startDate && endDate ? {
+          saleDate: {
+            $gte: new Date(startDate),
+            $lte: new Date(endDate)
+          }
+        } : {}),
+        ...(shopId && shopId !== 'all' ? {
+          $or: [
+            { shop: shopId },
+            { shopId: shopId }
+          ]
+        } : {})
+      })
+      .populate('shop', 'name location')
+      .populate('cashierId', 'name email')
+      .sort({ saleDate: -1 })
+      .lean(),
+      models.Shop.find().lean(),
+      models.Cashier.find().lean(),
+      models.Product.find({}).lean(),
+      models.Expense.find({})
+        .populate('shop', 'name')
+        .lean()
+    ]);
 
-    if (shopId && shopId !== 'all') {
-      filter.$or = [
-        { shop: shopId },
-        { shopId: shopId }
-      ];
-    }
+    const totalTransactions = transactions.length;
+    const totalRevenue = CalculationUtils.calculateRevenue(transactions);
+    const costOfGoodsSold = CalculationUtils.calculateCOGS(transactions);
+    const grossProfit = totalRevenue - costOfGoodsSold;
+    
+    const totalExpenses = expenses.reduce((sum, e) => sum + CalculationUtils.safeNumber(e.amount), 0);
+    const netProfit = grossProfit - totalExpenses;
+    
+    const paymentComposition = CalculationUtils.calculatePaymentComposition(transactions);
 
-    const transactions = await models.Transaction.find(filter)
-      .populate('cashierId', 'name email shopName')
-      .sort({ saleDate: -1 });
+    const financialStats = {
+      totalSales: totalTransactions,
+      totalRevenue: totalRevenue,
+      totalExpenses: totalExpenses,
+      grossProfit: grossProfit,
+      netProfit: netProfit,
+      costOfGoodsSold: costOfGoodsSold,
+      totalMpesaBank: paymentComposition.mpesa_bank,
+      totalCash: paymentComposition.cash,
+      profitMargin: CalculationUtils.calculateProfitMargin(totalRevenue, netProfit),
+      totalItemsSold: transactions.reduce((sum, t) => sum + CalculationUtils.safeNumber(t.itemsCount || 0), 0),
+      averageTransactionValue: totalTransactions > 0 ? totalRevenue / totalTransactions : 0
+    };
 
-    const cashierPerformance = {};
-
-    transactions.forEach(transaction => {
-      const cashierId = transaction.cashierId?._id || transaction.cashierId;
-      const cashierName = transaction.cashierName || 'Unknown';
-
-      if (!cashierPerformance[cashierId]) {
-        cashierPerformance[cashierId] = {
-          cashierId,
-          cashierName,
-          totalTransactions: 0,
-          totalAmount: 0,
-          cashAmount: 0,
-          bankMpesaAmount: 0,
-          averageTransaction: 0,
-          lastTransactionDate: transaction.saleDate
-        };
+    const dashboardData = {
+      transactions: transactions,
+      shops: shops,
+      cashiers: cashiers,
+      products: products,
+      expenses: expenses,
+      summary: financialStats,
+      financialStats: financialStats,
+      enhancedStats: {
+        salesWithProfit: transactions,
+        financialStats: financialStats
+      },
+      paymentComposition: paymentComposition,
+      loadedAt: new Date().toISOString(),
+      dataSources: {
+        transactions: transactions.length,
+        shops: shops.length,
+        cashiers: cashiers.length,
+        products: products.length,
+        expenses: expenses.length
       }
+    };
 
-      const cashAmount = CalculationUtils.safeNumber(transaction.paymentSplit?.cash);
-      const bankMpesaAmount = CalculationUtils.safeNumber(transaction.paymentSplit?.bank_mpesa);
-      const totalAmount = cashAmount + bankMpesaAmount;
-
-      cashierPerformance[cashierId].totalTransactions++;
-      cashierPerformance[cashierId].totalAmount += totalAmount;
-      cashierPerformance[cashierId].cashAmount += cashAmount;
-      cashierPerformance[cashierId].bankMpesaAmount += bankMpesaAmount;
-      cashierPerformance[cashierId].lastTransactionDate = transaction.saleDate;
-    });
-
-    // Calculate averages and percentages
-    const performanceArray = Object.values(cashierPerformance).map(performance => ({
-      ...performance,
-      averageTransaction: performance.totalTransactions > 0 
-        ? performance.totalAmount / performance.totalTransactions 
-        : 0,
-      cashPercentage: performance.totalAmount > 0 
-        ? (performance.cashAmount / performance.totalAmount) * 100 
-        : 0,
-      bankMpesaPercentage: performance.totalAmount > 0 
-        ? (performance.bankMpesaAmount / performance.totalAmount) * 100 
-        : 0
-    })).sort((a, b) => b.totalAmount - a.totalAmount);
+    console.log('✅ Dashboard data loaded successfully');
 
     res.json({
       success: true,
-      data: performanceArray,
-      message: 'Cashier payment performance analysis completed'
+      data: dashboardData,
+      message: 'Dashboard data fetched successfully'
     });
 
   } catch (error) {
-    console.error('❌ Error analyzing cashier payment performance:', error);
+    console.error('❌ Error loading dashboard data:', error);
     res.status(500).json({
       success: false,
-      message: 'Failed to analyze cashier payment performance',
+      message: 'Failed to load dashboard data',
       error: error.message
     });
   }
 });
 
-// ==================== ROOT ENDPOINT ====================
+// Cashier dashboard metrics
+app.get('/api/cashier/dashboard-metrics', async (req, res) => {
+  try {
+    const { cashierId, startDate, endDate } = req.query;
+    const { models } = req;
 
-app.get('/', (req, res) => {
-  res.json({
-    message: process.env.APP_NAME || 'Stanzo Shop Management API',
-    version: process.env.APP_VERSION || '3.0.0',
-    status: 'running',
-    timestamp: new Date().toISOString(),
-    features: {
-      tokenAuthentication: 'enabled',
-      paymentComposition: 'enabled',
-      shopDataIsolation: 'enabled',
-      cashierDataIsolation: 'enabled',
-      barcodeManagement: 'enabled',
-      auditLogging: 'enabled',
-      supermarketPOS: 'enabled'
-    },
-    security: {
-      tokenExpiry: TOKEN_EXPIRY,
-      refreshTokenExpiry: REFRESH_TOKEN_EXPIRY,
-      tokenBlacklisting: 'enabled'
+    if (!cashierId) {
+      return res.status(400).json({
+        success: false,
+        message: 'Cashier ID is required'
+      });
     }
-  });
+
+    console.log('👤 Fetching cashier dashboard metrics:', { cashierId, startDate, endDate });
+
+    const defaultStartDate = new Date();
+    defaultStartDate.setDate(defaultStartDate.getDate() - 30);
+    
+    const start = startDate ? new Date(startDate) : defaultStartDate;
+    const end = endDate ? new Date(endDate) : new Date();
+    
+    start.setHours(0, 0, 0, 0);
+    end.setHours(23, 59, 59, 999);
+
+    const transactions = await models.Transaction.find({
+      cashierId: cashierId,
+      status: 'completed',
+      saleDate: { $gte: start, $lte: end }
+    });
+
+    const totalTransactions = transactions.length;
+    const totalSales = transactions.reduce((sum, t) => 
+      sum + CalculationUtils.safeNumber(t.totalAmount), 0);
+    
+    const totalCash = transactions.reduce((sum, t) => 
+      sum + CalculationUtils.safeNumber(t.paymentSplit?.cash || 0), 0);
+    
+    const totalMpesaBank = transactions.reduce((sum, t) => 
+      sum + CalculationUtils.safeNumber(t.paymentSplit?.mpesa_bank || 0), 0);
+    
+    const itemsSold = transactions.reduce((sum, t) => 
+      sum + CalculationUtils.safeNumber(t.itemsCount || 0), 0);
+    
+    const averageTransaction = totalTransactions > 0 ? totalSales / totalTransactions : 0;
+    
+    const totalProfit = transactions.reduce((sum, t) => 
+      sum + CalculationUtils.safeNumber(t.profit || 0), 0);
+    
+    const profitMargin = totalSales > 0 ? (totalProfit / totalSales) * 100 : 0;
+    const digitalPaymentRatio = totalSales > 0 ? (totalMpesaBank / totalSales) * 100 : 0;
+    const cashPaymentRatio = totalSales > 0 ? (totalCash / totalSales) * 100 : 0;
+
+    const metrics = {
+      totalSales,
+      totalTransactions,
+      totalCash,
+      totalMpesaBank,
+      itemsSold,
+      averageTransaction,
+      profitMargin,
+      digitalPaymentRatio,
+      cashPaymentRatio
+    };
+
+    res.json({
+      success: true,
+      data: metrics,
+      message: 'Cashier dashboard metrics fetched successfully'
+    });
+
+  } catch (error) {
+    console.error('❌ Error fetching cashier dashboard metrics:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch cashier dashboard metrics',
+      error: error.message
+    });
+  }
 });
 
-// Health check endpoint
+// ==================== ROOT AND HEALTH ENDPOINTS ====================
+
 app.get('/api/health', (req, res) => {
+  const dbStatus = cachedConnection?.readyState === 1 ? 'connected' : 'disconnected';
+  
   res.json({
     success: true,
     status: 'healthy',
     timestamp: new Date().toISOString(),
-    database: req.dbConnection?.readyState === 1 ? 'connected' : 'disconnected',
-    uptime: process.uptime()
+    database: dbStatus,
+    uptime: process.uptime(),
+    environment: process.env.NODE_ENV || 'development',
+    serverless: true,
+    platform: 'vercel'
   });
 });
 
-// 404 handler
+app.get('/api/test', (req, res) => {
+  res.json({
+    success: true,
+    message: 'API is working!',
+    timestamp: new Date().toISOString(),
+    features: {
+      cashierManagement: 'enabled',
+      analytics: 'enabled',
+      transactions: 'enabled',
+      products: 'enabled',
+      shops: 'enabled',
+      expenses: 'enabled',
+      authentication: 'enabled'
+    },
+    deployment: 'serverless-vercel'
+  });
+});
+
+app.get('/', (req, res) => {
+  res.json({
+    message: 'Stanzo Shop Management API',
+    version: '4.1.0',
+    status: 'running',
+    timestamp: new Date().toISOString(),
+    deployment: 'serverless-vercel',
+    endpoints: {
+      cashiers: '/api/cashiers',
+      cashierPerformance: '/api/cashiers/:id/performance',
+      transactions: '/api/transactions',
+      combinedTransactions: '/api/transactions/combined',
+      products: '/api/products',
+      shops: '/api/shops',
+      expenses: '/api/expenses',
+      auth: '/api/auth/*',
+      health: '/api/health'
+    }
+  });
+});
+
+// Catch-all for undefined API routes
 app.use('/api/*', (req, res) => {
   res.status(404).json({
     success: false,
@@ -3358,8 +3959,7 @@ app.use('/api/*', (req, res) => {
   });
 });
 
-// ==================== ERROR HANDLER ====================
-
+// Error handler
 app.use((err, req, res, next) => {
   console.error('❌ Server error:', err.message);
   
@@ -3376,6 +3976,7 @@ app.use((err, req, res, next) => {
     error: process.env.NODE_ENV === 'development' ? err.message : undefined
   });
 });
+
 
 // ==================== SERVER STARTUP ====================
 
@@ -3397,21 +3998,24 @@ if (require.main === module) {
       
       app.listen(PORT, '0.0.0.0', () => {
         console.log('\n' + '='.repeat(60));
-        console.log(`🚀 ENHANCED SUPERMARKET MANAGEMENT SERVER STARTED SUCCESSFULLY!`);
+        console.log(`🚀 STANZO SHOP MANAGEMENT SERVER STARTED SUCCESSFULLY!`);
         console.log('='.repeat(60));
         console.log(`📡 Port: ${PORT}`);
         console.log(`🌐 Local: http://localhost:${PORT}`);
         console.log(`🌐 Network: http://0.0.0.0:${PORT}`);
         console.log(`📊 Health check: http://localhost:${PORT}/api/health`);
+        console.log(`🔐 Test endpoint: http://localhost:${PORT}/api/test`);
         console.log(`⏰ Started at: ${new Date().toLocaleString()}`);
-        console.log(`🔐 Token Authentication: ENABLED`);
-        console.log(`💰 Payment Composition: ENABLED`);
-        console.log(`🏪 Shop Data Isolation: ENABLED`);
-        console.log(`👤 Cashier Data Isolation: ENABLED`);
-        console.log(`📦 Barcode Management: ENABLED`);
+        console.log(`📊 Cashier Analytics: ENABLED`);
+        console.log(`📈 Performance Metrics: ENABLED`);
+        console.log(`🏪 Shop Management: ENABLED`);
+        console.log(`📦 Product Management: ENABLED`);
+        console.log(`💳 Transaction Processing: ENABLED`);
+        console.log(`💰 Expense Tracking: ENABLED`);
+        console.log(`🔐 Authentication: ENABLED`);
         console.log(`📝 Audit Logging: ENABLED`);
-        console.log(`🎫 Token Expiry: ${TOKEN_EXPIRY}`);
-        console.log(`🔄 Token Refresh: ENABLED`);
+        console.log(`🔄 Real-time Updates: ENABLED`);
+        console.log(`🎫 BARCODE FUNCTIONALITY: REMOVED`);
         console.log('='.repeat(60) + '\n');
       });
       
@@ -3424,4 +4028,11 @@ if (require.main === module) {
   startServer();
 }
 
-module.exports = app;
+module.exports = {
+  app,
+  connectDB,
+  TokenManager,
+  CalculationUtils,
+  AnalyticsService,
+  models: cachedModels
+};

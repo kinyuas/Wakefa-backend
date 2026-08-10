@@ -48,7 +48,7 @@ const connectDB = async () => {
   try {
     
     
-    const conn = await mongoose.connect(process.env.MONGO_URI || 'mongodb+srv://kinyuastanzo6759_db_user:Y9P9gdROuewvBmq8@cluster0.4rtcx4y.mongodb.net/?retryWrites=true&w=majority', {
+    const conn = await mongoose.connect(process.env.MONGO_URI || 'mongodb+srv://kinyuastanzo6759_db_user:Y9P9gdROuewvBmq8@cluster0.4rtcx4y.mongodb.net/kianjirusupermarket_db?retryWrites=true&w=majority', {
       useNewUrlParser: true,
       useUnifiedTopology: true,
       serverSelectionTimeoutMS: 5000,
@@ -58,7 +58,7 @@ const connectDB = async () => {
       // bufferMaxEntries: 0, // <-- Remove this line
       
       // Add these recommended options instead:
-      connectTimeoutMS: 10000, // Give up initial connection after 10 seconds
+      connectTimeoutMS: 30000, // Give up initial connection after 10 seconds
       family: 4, // Use IPv4, skip trying IPv6
       retryWrites: true,
       w: 'majority'
