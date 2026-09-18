@@ -1,260 +1,178 @@
+// routes/expenses.js
 const express = require('express');
 const router = express.Router();
+
 const Expense = require('../models/Expense');
-const catchAsync = require('../utils/catchAsync');
-const AppError = require('../utils/appError');
+const Shop = require('../models/Shop');
+const { protect } = require('../middleware/auth');
 
-// Get all expenses
-router.get('/', catchAsync(async (req, res, next) => {
-  const { page = 1, limit = 50, startDate, endDate, category, shop, paymentMethod } = req.query;
-  
-  const filter = {};
-  
-  // Date filter
-  if (startDate && endDate) {
-    filter.date = {
-      $gte: new Date(startDate),
-      $lte: new Date(endDate)
-    };
-  } else {
-    // Default to last 30 days if no date range provided
-    filter.date = {
-      $gte: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000)
-    };
-  }
-  
-  if (category && category !== 'all') filter.category = category;
-  if (shop && shop !== 'all') filter.shop = shop;
-  if (paymentMethod && paymentMethod !== 'all') filter.paymentMethod = paymentMethod;
+router.use(protect);
 
-  const expenses = await Expense.find(filter)
-    .populate('shop', 'name shopName')
-    .sort({ date: -1, createdAt: -1 })
-    .limit(limit * 1)
-    .skip((page - 1) * limit);
+// GET all expenses
+router.get('/', async (req, res) => {
+  try {
+    const { shopId, startDate, endDate, page = 1, limit = 50 } = req.query;
+    const filter = {};
 
-  const total = await Expense.countDocuments(filter);
+    if (shopId && shopId !== 'all') filter.shop = shopId;
 
-  res.json({
-    success: true,
-    data: expenses,
-    pagination: {
-      current: parseInt(page),
-      total: Math.ceil(total / limit),
-      results: total
+    if (startDate && endDate) {
+      const s = new Date(startDate);
+      s.setHours(0, 0, 0, 0);
+      const e = new Date(endDate);
+      e.setHours(23, 59, 59, 999);
+      filter.date = { $gte: s, $lte: e };
     }
-  });
-}));
 
-// Get single expense
-router.get('/:id', catchAsync(async (req, res, next) => {
-  const expense = await Expense.findById(req.params.id).populate('shop', 'name shopName');
-  
-  if (!expense) {
-    return next(new AppError('Expense not found', 404));
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+
+    const [data, total] = await Promise.all([
+      Expense.find(filter)
+        .populate('shop', 'name location')
+        .sort({ date: -1 })
+        .skip(skip)
+        .limit(parseInt(limit)),
+      Expense.countDocuments(filter)
+    ]);
+
+    res.json({
+      success: true,
+      data,
+      count: data.length,
+      total,
+      page: parseInt(page),
+      totalPages: Math.ceil(total / parseInt(limit))
+    });
+  } catch (err) {
+    console.error('Get expenses error:', err);
+    res.status(500).json({ success: false, message: 'Failed to fetch expenses' });
   }
+});
 
-  res.json({
-    success: true,
-    data: expense
-  });
-}));
+// CREATE expense
+router.post('/', async (req, res) => {
+  try {
+    const data = { ...req.body };
 
-// Create new expense
-router.post('/', catchAsync(async (req, res, next) => {
-  const { 
-    category, 
-    amount, 
-    date, 
-    paymentMethod, 
-    description, 
-    shop, 
-    shopName, 
-    recordedBy, 
-    notes, 
-    referenceNumber,
-    status 
-  } = req.body;
-
-  // Enhanced validation
-  if (!category || !amount || !shop) {
-    return next(new AppError('Missing required fields: category, amount, and shop are required', 400));
-  }
-
-  if (amount <= 0) {
-    return next(new AppError('Amount must be greater than 0', 400));
-  }
-
-  // Check if shop exists (you might want to add this validation)
-  // const shopExists = await Shop.findById(shop);
-  // if (!shopExists) {
-  //   return next(new AppError('Shop not found', 404));
-  // }
-
-  const expenseData = {
-    category: category.toLowerCase(),
-    amount: parseFloat(amount),
-    paymentMethod: (paymentMethod || 'cash').toLowerCase(),
-    date: date ? new Date(date) : new Date(),
-    description: description || `${category} expense`,
-    shop: shop,
-    shopName: shopName,
-    recordedBy: recordedBy || 'System',
-    notes: notes || '',
-    referenceNumber: referenceNumber || `EXP-${Date.now().toString().slice(-6)}`,
-    status: status || 'completed',
-    createdBy: req.user?._id || '65d8f1a9c8b9c4a7e8f3b2a1' // Default for demo
-  };
-
-  const expense = await Expense.create(expenseData);
-
-  // Populate the shop info in response
-  await expense.populate('shop', 'name shopName');
-
-  res.status(201).json({
-    success: true,
-    message: 'Expense recorded successfully',
-    data: expense
-  });
-}));
-
-// Update expense
-router.put('/:id', catchAsync(async (req, res, next) => {
-  const { category, amount, date, paymentMethod, description, shop, notes } = req.body;
-
-  const expense = await Expense.findById(req.params.id);
-  
-  if (!expense) {
-    return next(new AppError('Expense not found', 404));
-  }
-
-  // Update fields
-  if (category) expense.category = category.toLowerCase();
-  if (amount) expense.amount = parseFloat(amount);
-  if (date) expense.date = new Date(date);
-  if (paymentMethod) expense.paymentMethod = paymentMethod.toLowerCase();
-  if (description) expense.description = description;
-  if (shop) expense.shop = shop;
-  if (notes !== undefined) expense.notes = notes;
-
-  await expense.save();
-  
-  // Populate the shop info in response
-  await expense.populate('shop', 'name shopName');
-
-  res.json({
-    success: true,
-    message: 'Expense updated successfully',
-    data: expense
-  });
-}));
-
-// Delete expense
-router.delete('/:id', catchAsync(async (req, res, next) => {
-  const expense = await Expense.findByIdAndDelete(req.params.id);
-  
-  if (!expense) {
-    return next(new AppError('Expense not found', 404));
-  }
-
-  res.json({
-    success: true,
-    message: 'Expense deleted successfully'
-  });
-}));
-
-// Get expense statistics
-router.get('/stats/overview', catchAsync(async (req, res, next) => {
-  const { startDate, endDate, shop } = req.query;
-  
-  const filter = {};
-  if (startDate && endDate) {
-    filter.date = {
-      $gte: new Date(startDate),
-      $lte: new Date(endDate)
-    };
-  } else {
-    // Default to last 30 days
-    filter.date = {
-      $gte: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000)
-    };
-  }
-  
-  if (shop && shop !== 'all') filter.shop = shop;
-
-  const stats = await Expense.aggregate([
-    { $match: filter },
-    {
-      $group: {
-        _id: null,
-        totalExpenses: { $sum: 1 },
-        totalAmount: { $sum: '$amount' },
-        averageExpense: { $avg: '$amount' },
-        minExpense: { $min: '$amount' },
-        maxExpense: { $max: '$amount' }
+    if (data.shop) {
+      const shop = await Shop.findById(data.shop);
+      if (shop) {
+        data.shopName = shop.name;
+        data.shopId = shop._id;
       }
     }
-  ]);
 
-  const byCategory = await Expense.aggregate([
-    { $match: filter },
-    {
-      $group: {
-        _id: '$category',
-        count: { $sum: 1 },
-        total: { $sum: '$amount' },
-        average: { $avg: '$amount' }
-      }
-    },
-    { $sort: { total: -1 } }
-  ]);
+    const expense = await Expense.create(data);
+    await expense.populate('shop', 'name location');
 
-  const byPaymentMethod = await Expense.aggregate([
-    { $match: filter },
-    {
-      $group: {
-        _id: '$paymentMethod',
-        count: { $sum: 1 },
-        total: { $sum: '$amount' },
-        average: { $avg: '$amount' }
+    res.status(201).json({ success: true, data: expense, message: 'Expense created' });
+  } catch (err) {
+    console.error('Create expense error:', err);
+    res.status(500).json({ success: false, message: 'Failed to create expense' });
+  }
+});
+
+// UPDATE expense
+router.put('/:id', async (req, res) => {
+  try {
+    const data = { ...req.body };
+
+    if (data.shop) {
+      const shop = await Shop.findById(data.shop);
+      if (shop) {
+        data.shopName = shop.name;
+        data.shopId = shop._id;
       }
     }
-  ]);
 
-  const byShop = await Expense.aggregate([
-    { $match: filter },
-    {
-      $group: {
-        _id: '$shop',
-        count: { $sum: 1 },
-        total: { $sum: '$amount' },
-        average: { $avg: '$amount' }
-      }
-    },
-    { $sort: { total: -1 } }
-  ]);
+    const expense = await Expense.findByIdAndUpdate(req.params.id, data, {
+      new: true,
+      runValidators: true
+    }).populate('shop', 'name location');
 
-  const recentExpenses = await Expense.find(filter)
-    .populate('shop', 'name shopName')
-    .sort({ date: -1, createdAt: -1 })
-    .limit(5);
-
-  res.json({
-    success: true,
-    data: {
-      overview: stats[0] || { 
-        totalExpenses: 0, 
-        totalAmount: 0, 
-        averageExpense: 0, 
-        minExpense: 0, 
-        maxExpense: 0 
-      },
-      byCategory,
-      byPaymentMethod,
-      byShop,
-      recentExpenses
+    if (!expense) {
+      return res.status(404).json({ success: false, message: 'Expense not found' });
     }
-  });
-}));
 
+    res.json({ success: true, data: expense, message: 'Expense updated' });
+  } catch (err) {
+    console.error('Update expense error:', err);
+    res.status(500).json({ success: false, message: 'Failed to update expense' });
+  }
+});
+
+// DELETE expense
+router.delete('/:id', async (req, res) => {
+  try {
+    const expense = await Expense.findByIdAndDelete(req.params.id);
+
+    if (!expense) {
+      return res.status(404).json({ success: false, message: 'Expense not found' });
+    }
+
+    res.json({ success: true, data: expense, message: 'Expense deleted' });
+  } catch (err) {
+    console.error('Delete expense error:', err);
+    res.status(500).json({ success: false, message: 'Failed to delete expense' });
+  }
+});
+
+// STATS overview
+router.get('/stats/overview', async (req, res) => {
+  try {
+    const { shopId, startDate, endDate } = req.query;
+    const filter = {};
+
+    if (shopId && shopId !== 'all') filter.shop = shopId;
+
+    if (startDate && endDate) {
+      const s = new Date(startDate);
+      s.setHours(0, 0, 0, 0);
+      const e = new Date(endDate);
+      e.setHours(23, 59, 59, 999);
+      filter.date = { $gte: s, $lte: e };
+    }
+
+    const expenses = await Expense.find(filter)
+      .populate('shop', 'name')
+      .sort({ date: -1 });
+
+    const totalAmount = expenses.reduce((s, e) => s + (e.amount || 0), 0);
+
+    const byCategory = {};
+    const byPayment = {};
+
+    expenses.forEach(e => {
+      byCategory[e.category] = (byCategory[e.category] || 0) + e.amount;
+      byPayment[e.paymentMethod] = (byPayment[e.paymentMethod] || 0) + e.amount;
+    });
+
+    res.json({
+      success: true,
+      data: {
+        overview: {
+          totalExpenses: expenses.length,
+          totalAmount,
+          averageExpense: expenses.length ? totalAmount / expenses.length : 0,
+          minExpense: expenses.length ? Math.min(...expenses.map(e => e.amount)) : 0,
+          maxExpense: expenses.length ? Math.max(...expenses.map(e => e.amount)) : 0
+        },
+        byCategory: Object.entries(byCategory).map(([category, total]) => ({
+          category,
+          total
+        })),
+        byPaymentMethod: Object.entries(byPayment).map(([method, total]) => ({
+          method,
+          total
+        })),
+        recentExpenses: expenses.slice(0, 10)
+      }
+    });
+  } catch (err) {
+    console.error('Expense stats error:', err);
+    res.status(500).json({ success: false, message: 'Failed to fetch expense stats' });
+  }
+});
+
+// ✅ MUST export the router (a function), not an object
 module.exports = router;

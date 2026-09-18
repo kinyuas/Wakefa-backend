@@ -1,85 +1,35 @@
-// const mongoose = require('mongoose');
-
-// const connectDB = async () => {
-//   try {
-//     const conn = await mongoose.connect(process.env.MONGO_URI || 'mongodb+srv://kinyuastanzo6759_db_user:Y9P9gdROuewvBmq8@cluster0.4rtcx4y.mongodb.net/?appName=Cluster0', {
-//       useNewUrlParser: true,
-//       useUnifiedTopology: true,
-//       serverSelectionTimeoutMS: 5000, // Timeout after 5s
-//       socketTimeoutMS: 45000, // Close sockets after 45s of inactivity
-//       maxPoolSize: 10, // Maintain up to 10 socket connections
-//       minPoolSize: 2 // Maintain at least 2 socket connections
-//     });
-
-//     console.log(`✅ MongoDB Connected: ${conn.connection.host}`.cyan.underline);
-    
-//     // Connection event listeners
-//     mongoose.connection.on('connected', () => {
-//       console.log('Mongoose connected to DB');
-//     });
-
-//     mongoose.connection.on('error', (err) => {
-//       console.error(`Mongoose connection error: ${err}`);
-//     });
-
-//     mongoose.connection.on('disconnected', () => {
-//       console.log('Mongoose disconnected');
-//     });
-
-//     // Close connection on app termination
-//     process.on('SIGINT', async () => {
-//       await mongoose.connection.close();
-//       console.log('Mongoose connection closed through app termination');
-//       process.exit(0);
-//     });
-
-//   } catch (err) {
-//     console.error(`❌ Database connection error: ${err.message}`.red);
-//     process.exit(1);
-//   }
-// };
-
-// module.exports = connectDB;
-
-
 const mongoose = require('mongoose');
 
 const connectDB = async () => {
   try {
+    const uri = process.env.MONGODB_URI;
     
-    
-    const conn = await mongoose.connect(process.env.MONGO_URI || 'mongodb+srv://kinyuastanzo6759_db_user:Y9P9gdROuewvBmq8@cluster0.4rtcx4y.mongodb.net/kianjirusupermarket_db?retryWrites=true&w=majority', {
+    if (!uri) {
+      throw new Error('MONGODB_URI is not defined in your .env file');
+    }
+
+    console.log('🔗 Attempting DB connection...');
+    console.log('📂 Target database:', uri.split('/').pop().split('?')[0]);
+
+    const conn = await mongoose.connect(uri, {
       useNewUrlParser: true,
       useUnifiedTopology: true,
       serverSelectionTimeoutMS: 5000,
       socketTimeoutMS: 45000,
       maxPoolSize: 10,
-      // Remove bufferMaxEntries if it exists
-      // bufferMaxEntries: 0, // <-- Remove this line
-      
-      // Add these recommended options instead:
-      connectTimeoutMS: 30000, // Give up initial connection after 10 seconds
-      family: 4, // Use IPv4, skip trying IPv6
+      connectTimeoutMS: 30000,
+      family: 4,
       retryWrites: true,
       w: 'majority'
     });
 
-    console.log(`✅ MongoDB Connected: ${conn.connection.host}`.cyan.underline);
-    
-    // Connection event listeners
-    mongoose.connection.on('connected', () => {
-      console.log('Mongoose connected to DB');
-    });
+    console.log(`✅ MongoDB Connected: ${conn.connection.host}`);
+    console.log(`📂 Actual database name: ${conn.connection.name}`);
 
-    mongoose.connection.on('error', (err) => {
-      console.error(`Mongoose connection error: ${err}`);
-    });
+    mongoose.connection.on('connected', () => console.log('Mongoose connected to DB'));
+    mongoose.connection.on('error', (err) => console.error(`Mongoose connection error: ${err}`));
+    mongoose.connection.on('disconnected', () => console.log('Mongoose disconnected'));
 
-    mongoose.connection.on('disconnected', () => {
-      console.log('Mongoose disconnected');
-    });
-
-    // Close connection on app termination
     process.on('SIGINT', async () => {
       await mongoose.connection.close();
       console.log('Mongoose connection closed through app termination');
@@ -87,7 +37,7 @@ const connectDB = async () => {
     });
 
   } catch (err) {
-    console.error(`❌ Database connection error: ${err.message}`.red);
+    console.error(`❌ Database connection error: ${err.message}`);
     process.exit(1);
   }
 };

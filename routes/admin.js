@@ -1,150 +1,56 @@
+// routes/admin.js
 const express = require('express');
-const router = express.Router();
-const Admin = require('../models/Admin');
 const jwt = require('jsonwebtoken');
-const { protect, authorize } = require('../middlewares/auth');
-const adminController = require('../controllers/adminController');
+const bcrypt = require('bcryptjs');
+const router = express.Router();
 
-// Admin login - FIXED TOKEN STRUCTURE
+const User = require('../models/User');
+const { JWT_SECRET } = require('../config/constants');
+const { protect, authorize } = require('../middleware/auth');
+
+// Admin login
 router.post('/login', async (req, res) => {
-  try {
-    const { email, password } = req.body;
+  const { email, password } = req.body;
+  if (!email || !password) return res.status(400).json({ success: false, message: 'Email and password required' });
 
-    console.log('🔐 Admin login attempt:', { email });
+  let admin = await User.findOne({ email: email.toLowerCase(), role: 'admin' });
 
-    // Validate input
-    if (!email || !password) {
-      return res.status(400).json({
-        success: false,
-        message: 'Email and password are required'
-      });
+  if (!admin) {
+    // Seed default admin if this is the seeded one
+    if (email.toLowerCase() !== 'kinyuastanzo6759@gmail.com') {
+      return res.status(401).json({ success: false, message: 'Invalid credentials' });
     }
-
-    // Get or create admin account
-    const admin = await Admin.getAdminAccount();
-    
-    // Check if email matches
-    if (email !== admin.email) {
-      console.log('❌ Email mismatch:', email, 'expected:', admin.email);
-      return res.status(401).json({
-        success: false,
-        message: 'Invalid admin credentials'
-      });
-    }
-
-    // Verify password
-    const isPasswordCorrect = await admin.correctPassword(password, admin.password);
-    
-    if (!isPasswordCorrect) {
-      console.log('❌ Password incorrect for admin:', email);
-      return res.status(401).json({
-        success: false,
-        message: 'Invalid admin credentials'
-      });
-    }
-
-    // Generate JWT token - USE CONSISTENT STRUCTURE
-    const token = jwt.sign(
-      { 
-        id: admin._id.toString(), // Ensure it's a string
-        role: 'admin' // Middleware expects 'role' field
-      },
-      process.env.JWT_SECRET || 'fallback_jwt_secret_change_in_production',
-      { expiresIn: '7d' } // 7 days expiration
-    );
-
-    console.log('✅ Admin login successful:', {
-      adminId: admin._id,
-      email: admin.email,
-      tokenLength: token.length
-    });
-
-    res.json({
-      success: true,
-      token,
-      admin: {
-        id: admin._id.toString(),
-        email: admin.email,
-        role: 'admin',
-        name: 'Administrator'
-      },
-      expiresIn: '7d',
-      message: 'Admin login successful'
-    });
-
-  } catch (error) {
-    console.error('❌ Admin login error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Server error during authentication'
+    admin = await User.create({
+      email: 'kinyuastanzo6759@gmail.com',
+      name: 'Administrator',
+      role: 'admin',
+      status: 'active',
+      password: await bcrypt.hash('Kinyua01', 12)
     });
   }
-});
 
-// Check token validity
-router.get('/check', protect, authorize('admin'), (req, res) => {
+  const valid = admin.password ? await bcrypt.compare(password, admin.password) : false;
+  if (!valid) return res.status(401).json({ success: false, message: 'Invalid credentials' });
+
+  admin.lastLogin = new Date();
+  admin.loginCount = (admin.loginCount || 0) + 1;
+  await admin.save();
+
+  const token = jwt.sign({ userId: admin._id, email: admin.email, role: 'admin', name: admin.name }, JWT_SECRET, { expiresIn: '7d' });
+
   res.json({
     success: true,
-    message: 'Token is valid',
-    user: req.user,
-    valid: true
+    token,
+    admin: { id: admin._id, email: admin.email, role: 'admin', name: admin.name },
+    message: 'Admin login successful'
   });
 });
 
-// Get admin dashboard data (protected)
+router.get('/check', protect, authorize('admin'), (req, res) => res.json({ success: true, valid: true, user: req.user }));
 router.get('/dashboard', protect, authorize('admin'), async (req, res) => {
-  try {
-    console.log('📊 Dashboard request from admin:', req.user.email);
-    
-    // Your dashboard logic here
-    const dashboardData = {
-      totalUsers: 1, // At least the admin
-      activeUsers: 1,
-      totalCashiers: 0,
-      totalClubs: 0,
-      user: req.user
-    };
-    
-    res.status(200).json({
-      success: true,
-      data: dashboardData,
-      message: 'Dashboard data retrieved successfully'
-    });
-  } catch (error) {
-    console.error('❌ Dashboard error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Server error retrieving dashboard data'
-    });
-  }
+  res.json({ success: true, data: { totalUsers: await User.countDocuments(), user: req.user } });
 });
-
-// Test route without auth
-router.get('/test', (req, res) => {
-  res.json({
-    success: true,
-    message: 'Admin route is working',
-    timestamp: new Date().toISOString()
-  });
-});
-
-// Logout route
-router.post('/logout', protect, authorize('admin'), (req, res) => {
-  console.log('👋 Admin logout:', req.user.email);
-  res.json({
-    success: true,
-    message: 'Logged out successfully'
-  });
-});
-
-// Profile route
-router.get('/profile', protect, authorize('admin'), (req, res) => {
-  res.json({
-    success: true,
-    data: {
-      user: req.user
-    }
-  });
-});
+router.get('/profile', protect, authorize('admin'), (req, res) => res.json({ success: true, data: { user: req.user } }));
+router.post('/logout', protect, authorize('admin'), (req, res) => res.json({ success: true, message: 'Logged out' }));
 
 module.exports = router;

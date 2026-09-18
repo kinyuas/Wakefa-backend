@@ -27,7 +27,7 @@ exports.login = catchAsync(async (req, res, next) => {
   }
 
   // Check if cashier exists && password is correct
-  const cashier = await Cashier.findOne({ email }).select('+password');
+  const cashier = await Cashier.findOne({ email: email.toLowerCase().trim() }).select('+password');
   
   if (!cashier || !(await bcrypt.compare(password, cashier.password))) {
     return next(new AppError('Incorrect email or password', 401));
@@ -35,8 +35,12 @@ exports.login = catchAsync(async (req, res, next) => {
 
   // Check if cashier is active
   if (cashier.status !== 'active') {
-    return next(new AppError('Your account has been deactivated', 401));
+    return next(new AppError('Your account has been deactivated. Please contact an administrator.', 401));
   }
+
+  // Record exact last login timestamp
+  cashier.lastLogin = new Date();
+  await cashier.save({ validateBeforeSave: false });
 
   // If everything ok, send token to client
   const token = generateCashierToken(cashier._id);
@@ -57,7 +61,7 @@ exports.login = catchAsync(async (req, res, next) => {
 // @route   POST /api/v1/cashiers
 // @access  Private/Admin
 exports.registerCashier = catchAsync(async (req, res, next) => {
-  const { name, email, password, club } = req.body;
+  const { name, email, password, club, phone } = req.body;
 
   // Validate input
   if (!name || !name.trim()) {
@@ -68,12 +72,12 @@ exports.registerCashier = catchAsync(async (req, res, next) => {
     return next(new AppError('Please provide a valid email', 400));
   }
 
-  if (!password || password.length < 8) {
-    return next(new AppError('Password must be at least 8 characters', 400));
+  if (!password || password.length < 6) {
+    return next(new AppError('Password must be at least 6 characters', 400));
   }
 
   // Check for existing cashier
-  const existingCashier = await Cashier.findOne({ email });
+  const existingCashier = await Cashier.findOne({ email: email.toLowerCase() });
   if (existingCashier) {
     return next(new AppError('Email already in use', 400));
   }
@@ -83,8 +87,9 @@ exports.registerCashier = catchAsync(async (req, res, next) => {
     name: name.trim(),
     email: email.toLowerCase(),
     password,
+    phone: phone ? phone.trim() : '',
     role: 'cashier',
-    club,
+    club: club || '',
     status: 'active' // Default status
   });
 
@@ -132,12 +137,12 @@ exports.getCashier = catchAsync(async (req, res, next) => {
   });
 });
 
-// @desc    Update cashier
+// @desc    Update cashier (supports partial updates including status & password)
 // @route   PATCH /api/v1/cashiers/:id
 // @access  Private/Admin
 exports.updateCashier = catchAsync(async (req, res, next) => {
   // Filter allowed fields to update
-  const allowedUpdates = ['name', 'email', 'status', 'club'];
+  const allowedUpdates = ['name', 'email', 'status', 'club', 'phone', 'password'];
   const updates = Object.keys(req.body);
   
   const isValidOperation = updates.every(update => 
@@ -158,16 +163,42 @@ exports.updateCashier = catchAsync(async (req, res, next) => {
     if (existingCashier) {
       return next(new AppError('Email already in use', 400));
     }
+    req.body.email = req.body.email.toLowerCase().trim();
   }
 
-  const cashier = await Cashier.findByIdAndUpdate(
-    req.params.id,
-    req.body,
-    { 
-      new: true,
-      runValidators: true
+  // Validate status enum
+  if (req.body.status && !['active', 'inactive'].includes(req.body.status)) {
+    return next(new AppError('Status must be either active or inactive', 400));
+  }
+
+  // Normalize fields
+  if (req.body.name) req.body.name = req.body.name.trim();
+  if (req.body.phone !== undefined) req.body.phone = req.body.phone ? req.body.phone.trim() : '';
+  if (req.body.club !== undefined) req.body.club = req.body.club || '';
+
+  // Handle password update (needs to go through model pre-save hook)
+  let cashier;
+  if (req.body.password) {
+    cashier = await Cashier.findById(req.params.id);
+    if (!cashier) {
+      return next(new AppError('No cashier found with that ID', 404));
     }
-  ).select('-password');
+    Object.keys(req.body).forEach(key => {
+      if (key !== 'password') cashier[key] = req.body[key];
+    });
+    cashier.password = req.body.password;
+    await cashier.save();
+    cashier = await Cashier.findById(req.params.id).select('-password');
+  } else {
+    cashier = await Cashier.findByIdAndUpdate(
+      req.params.id,
+      req.body,
+      { 
+        new: true,
+        runValidators: true
+      }
+    ).select('-password');
+  }
 
   if (!cashier) {
     return next(new AppError('No cashier found with that ID', 404));

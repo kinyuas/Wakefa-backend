@@ -1,311 +1,307 @@
+// routes/auth.js
 const express = require('express');
-const asyncHandler = require('../middlewares/async');
-const { protect, authorize } = require('../middlewares/auth');
-const Cashier = require('../models/Cashier');
-const Admin = require('../models/Admin');
 const bcrypt = require('bcryptjs');
-
+const crypto = require('crypto');
+const { body, validationResult } = require('express-validator');
 const router = express.Router();
 
-// Main login endpoint - handles both admin and cashier logins
-router.post('/login', asyncHandler(async (req, res) => {
-  const { email, password } = req.body;
+const User = require('../models/User');
+const Cashier = require('../models/Cashier');
+const SecureCode = require('../models/SecureCode');
+const CashierSession = require('../models/CashierSession');
 
-  // Check if email and password exist
-  if (!email || !password) {
-    return res.status(400).json({
-      success: false,
-      message: 'Please provide email and password'
-    });
+const { TokenManager } = require('../utils/TokenManager');
+const { sendSecureCodeEmail } = require('../utils/emailService');
+const auditLogger = require('../utils/auditLogger');
+const { requestCodeLimiter, verifyCodeLimiter, loginLimiter } = require('../middleware/rateLimiters');
+const { protect } = require('../middleware/auth');
+const {
+  CODE_COOLDOWN_MS, CODE_EXPIRY_MINUTES, MAX_CODE_ATTEMPTS, INACTIVITY_LIMIT_MS
+} = require('../config/constants');
+
+const generateCode = () => Math.floor(100000 + Math.random() * 900000).toString();
+
+// ---------- Activity tracking ----------
+router.post('/activity', async (req, res) => {
+  const token = req.header('Authorization')?.replace('Bearer ', '');
+  if (!token) return res.status(400).json({ success: false, message: 'No token' });
+
+  if (await TokenManager.isTokenBlacklisted(token))
+    return res.status(401).json({ success: false, message: 'Session expired', code: 'SESSION_EXPIRED' });
+
+  const decoded = TokenManager.verifyToken(token);
+  if (!decoded) return res.status(401).json({ success: false, message: 'Invalid token', code: 'SESSION_EXPIRED' });
+
+  const lastActivity = decoded.lastActivity || decoded.iat * 1000;
+  if (Date.now() - lastActivity > INACTIVITY_LIMIT_MS) {
+    await TokenManager.blacklistToken(token, decoded.userId, 'inactivity');
+    return res.status(401).json({ success: false, message: 'Session expired', code: 'SESSION_EXPIRED' });
   }
 
-  console.log('🔐 Login attempt for:', email);
+  if (decoded.role === 'cashier') {
+    await CashierSession.updateOne(
+      { cashierId: decoded.userId, status: 'active' },
+      { lastActivity: new Date() }
+    );
+  }
 
-  // First, check if it's an admin
-  let user = await Admin.findOne({ email: email.toLowerCase() });
-  let userRole = 'admin';
+  const newToken = TokenManager.generateToken({
+    userId: decoded.userId,
+    email: decoded.email,
+    role: decoded.role,
+    name: decoded.name
+  });
+
+  res.json({ success: true, message: 'Activity recorded', token: newToken });
+});
+
+// ---------- Validate session ----------
+router.post('/validate-session', protect, async (req, res) => {
+  let user = null;
+  if (req.user.role === 'admin') user = await User.findById(req.user.id).lean();
+  else if (req.user.role === 'cashier') user = await Cashier.findById(req.user.id).lean();
 
   if (!user) {
-    // If not admin, check for cashier
-    user = await Cashier.findOne({ email: email.toLowerCase() }).select('+password');
-    userRole = 'cashier';
-  }
-
-  if (!user) {
-    console.log('❌ User not found:', email);
-    return res.status(401).json({
-      success: false,
-      message: 'Incorrect email or password'
+    return res.json({
+      success: true,
+      message: 'Session valid (offline mode)',
+      user: { id: req.user.id, email: req.user.email, name: req.user.name, role: req.user.role, status: 'active' },
+      offlineMode: true
     });
   }
 
-  // Verify password
-  let isPasswordValid = false;
-  
-  if (userRole === 'admin') {
-    // For admin, check against environment variable or stored hash
-    const adminPassword = process.env.ADMIN_PASSWORD || 'admin123';
-    isPasswordValid = password === adminPassword;
-    
-    // If admin has a password hash, use bcrypt
-    if (user.password) {
-      isPasswordValid = await bcrypt.compare(password, user.password);
+  const status = user.status || (user.isActive ? 'active' : 'inactive');
+  if (status !== 'active') {
+    return res.status(401).json({ success: false, message: 'Account inactive', code: 'SESSION_EXPIRED' });
+  }
+
+  res.json({
+    success: true,
+    message: 'Session valid',
+    user: { id: user._id, email: user.email, name: user.name, role: user.role, status }
+  });
+});
+
+// ---------- Logout ----------
+router.post('/logout', async (req, res) => {
+  const token = req.header('Authorization')?.replace('Bearer ', '');
+  if (token) {
+    const decoded = TokenManager.verifyToken(token);
+    if (decoded?.userId) {
+      await TokenManager.blacklistToken(token, decoded.userId, 'logout');
+      await CashierSession.updateOne(
+        { cashierId: decoded.userId, token },
+        { status: 'logged_out' }
+      );
     }
-  } else {
-    // For cashier, always use bcrypt
-    isPasswordValid = await bcrypt.compare(password, user.password);
   }
+  res.json({ success: true, message: 'Logged out' });
+});
 
-  if (!isPasswordValid) {
-    console.log('❌ Invalid password for:', email);
-    return res.status(401).json({
-      success: false,
-      message: 'Incorrect email or password'
-    });
-  }
+// ---------- Request secure code ----------
+//
+// Anti-duplicate-email protection (3 layers):
+//   1. requestCodeLimiter — 1 req / 60s per IP+email
+//   2. Cooldown check — reuse recent code, do NOT send again
+//   3. Atomic upsert — concurrent requests cannot both create codes
+router.post('/request-code',
+  requestCodeLimiter,
+  [body('email').isEmail().normalizeEmail()],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) return res.status(400).json({ success: false, error: 'Invalid email' });
 
-  // Check if user is active
-  if (user.status !== 'active') {
-    console.log('❌ Account deactivated:', email);
-    return res.status(401).json({
-      success: false,
-      message: 'Your account has been deactivated'
-    });
-  }
+    const { email } = req.body;
+    const user = await User.findOne({ email }) || await Cashier.findOne({ email });
+    if (!user) return res.status(404).json({ success: false, message: 'No account with this email' });
 
-  // Remove password from output
-  if (user.password) {
-    user.password = undefined;
-  }
-
-  // Update last login
-  user.lastLogin = new Date();
-  await user.save({ validateBeforeSave: false });
-
-  // Create user response object
-  const userResponse = {
-    _id: user._id,
-    name: user.name,
-    email: user.email,
-    role: userRole,
-    status: user.status,
-    lastLogin: user.lastLogin
-  };
-
-  // Add role-specific fields
-  if (userRole === 'cashier') {
-    userResponse.phone = user.phone;
-    userResponse.club = user.club;
-  }
-
-  console.log('✅ Login successful:', email, 'Role:', userRole);
-
-  // Set session if available
-  if (req.session) {
-    req.session.user = userResponse;
-    console.log('✅ Session created for user:', email);
-  }
-
-  res.status(200).json({
-    success: true,
-    user: userResponse,
-    message: `${userRole.charAt(0).toUpperCase() + userRole.slice(1)} login successful`
-  });
-}));
-
-// Cashier-specific login endpoint
-router.post('/cashier/login', asyncHandler(async (req, res) => {
-  const { email, password } = req.body;
-
-  if (!email || !password) {
-    return res.status(400).json({
-      success: false,
-      message: 'Please provide email and password'
-    });
-  }
-
-  console.log('🔐 Cashier login attempt for:', email);
-
-  const cashier = await Cashier.findOne({ email: email.toLowerCase() }).select('+password');
-  
-  if (!cashier || !(await bcrypt.compare(password, cashier.password))) {
-    console.log('❌ Invalid cashier credentials:', email);
-    return res.status(401).json({
-      success: false,
-      message: 'Incorrect email or password'
-    });
-  }
-
-  if (cashier.status !== 'active') {
-    console.log('❌ Cashier account deactivated:', email);
-    return res.status(401).json({
-      success: false,
-      message: 'Your account has been deactivated'
-    });
-  }
-
-  // Remove password from output
-  cashier.password = undefined;
-
-  // Update last login
-  cashier.lastLogin = new Date();
-  await cashier.save({ validateBeforeSave: false });
-
-  const cashierResponse = {
-    _id: cashier._id,
-    name: cashier.name,
-    email: cashier.email,
-    phone: cashier.phone,
-    club: cashier.club,
-    role: 'cashier',
-    status: cashier.status,
-    lastLogin: cashier.lastLogin
-  };
-
-  // Set session if available
-  if (req.session) {
-    req.session.user = cashierResponse;
-  }
-
-  console.log('✅ Cashier login successful:', email);
-
-  res.status(200).json({
-    success: true,
-    user: cashierResponse,
-    message: 'Cashier login successful'
-  });
-}));
-
-// Register new cashier (admin only)
-router.post('/register', protect, authorize('admin'), asyncHandler(async (req, res) => {
-  const { name, email, password, phone, club } = req.body;
-
-  // Validation
-  if (!name || !email || !password || !phone) {
-    return res.status(400).json({
-      success: false,
-      message: 'Name, email, phone, and password are required'
-    });
-  }
-
-  // Check if cashier already exists
-  const existingCashier = await Cashier.findOne({ 
-    $or: [{ email: email.toLowerCase() }, { phone }] 
-  });
-  
-  if (existingCashier) {
-    return res.status(400).json({
-      success: false,
-      message: 'Cashier with this email or phone already exists'
-    });
-  }
-
-  // Create new cashier
-  const cashier = await Cashier.create({
-    name: name.trim(),
-    email: email.toLowerCase().trim(),
-    password,
-    phone: phone.trim(),
-    club: club || '',
-    role: 'cashier',
-    status: 'active'
-  });
-
-  // Remove password from output
-  cashier.password = undefined;
-
-  console.log('✅ New cashier registered:', email);
-
-  res.status(201).json({
-    success: true,
-    message: 'Cashier created successfully',
-    user: {
-      _id: cashier._id,
-      name: cashier.name,
-      email: cashier.email,
-      phone: cashier.phone,
-      club: cashier.club,
-      role: cashier.role,
-      status: cashier.status
-    }
-  });
-}));
-
-// Logout endpoint
-router.post('/logout', asyncHandler(async (req, res) => {
-  // Clear session if exists
-  if (req.session) {
-    req.session.destroy((err) => {
-      if (err) {
-        console.error('Logout session error:', err);
+    // --- Cooldown check ---
+    const existing = await SecureCode.findOne({ email });
+    if (existing && !existing.used && existing.createdAt) {
+      const age = Date.now() - new Date(existing.createdAt).getTime();
+      if (age < CODE_COOLDOWN_MS) {
+        const wait = Math.ceil((CODE_COOLDOWN_MS - age) / 1000);
+        console.log(`⏳ Cooldown active for ${email} — ${wait}s. Skipping email.`);
+        return res.json({
+          success: true,
+          message: 'A code was already sent. Please check your inbox.',
+          cooldown: true,
+          retryAfterSeconds: wait,
+          expiresIn: CODE_EXPIRY_MINUTES
+        });
       }
+    }
+
+    const code = generateCode();
+    const expiresAt = new Date(Date.now() + CODE_EXPIRY_MINUTES * 60 * 1000);
+    const hashedCode = await bcrypt.hash(code, 10);
+
+    await SecureCode.findOneAndUpdate(
+      { email },
+      { code: hashedCode, expiresAt, attempts: 0, used: false, createdAt: new Date() },
+      { upsert: true, new: true }
+    );
+
+    const sent = await sendSecureCodeEmail(email, code);
+    if (!sent && process.env.NODE_ENV === 'production') {
+      return res.status(500).json({ success: false, message: 'Failed to send email' });
+    }
+
+    res.json({
+      success: true,
+      message: sent ? 'Secure code sent' : 'Code generated (dev mode)',
+      expiresIn: CODE_EXPIRY_MINUTES
     });
   }
+);
 
-  console.log('✅ User logged out');
+// ---------- Verify secure code ----------
+router.post('/verify-code',
+  verifyCodeLimiter,
+  [body('email').isEmail().normalizeEmail(), body('code').isLength({ min: 6, max: 6 }).isNumeric()],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) return res.status(400).json({ success: false, message: 'Invalid input' });
 
-  res.status(200).json({
-    success: true,
-    message: 'Logout successful'
-  });
-}));
+    const { email, code } = req.body;
+    const sc = await SecureCode.findOne({ email });
+    if (!sc) return res.status(404).json({ success: false, message: 'No code found. Request a new one.' });
 
-// Get current user profile
-router.get('/me', protect, asyncHandler(async (req, res) => {
-  let userData;
-  
-  if (req.user.role === 'admin') {
-    userData = {
-      _id: req.user._id,
-      name: req.user.name,
-      email: req.user.email,
-      role: 'admin',
-      status: 'active',
-      lastLogin: req.user.lastLogin
-    };
-  } else {
-    const cashier = await Cashier.findById(req.user._id);
-    if (!cashier) {
-      return res.status(404).json({
+    if (new Date() > sc.expiresAt) {
+      await SecureCode.deleteOne({ email });
+      return res.status(400).json({ success: false, message: 'Code expired' });
+    }
+    if (sc.used) return res.status(400).json({ success: false, message: 'Code already used' });
+    if (sc.attempts >= MAX_CODE_ATTEMPTS) {
+      await SecureCode.deleteOne({ email });
+      return res.status(400).json({ success: false, message: 'Too many attempts' });
+    }
+
+    const valid = await bcrypt.compare(code, sc.code);
+    if (!valid) {
+      sc.attempts += 1;
+      await sc.save();
+      return res.status(400).json({
         success: false,
-        message: 'User not found'
+        message: 'Invalid code',
+        attemptsRemaining: MAX_CODE_ATTEMPTS - sc.attempts
       });
     }
-    userData = {
-      _id: cashier._id,
-      name: cashier.name,
-      email: cashier.email,
-      phone: cashier.phone,
-      club: cashier.club,
-      role: cashier.role,
-      status: cashier.status,
-      lastLogin: cashier.lastLogin
+
+    sc.used = true;
+    await sc.save();
+
+    const user = await User.findOne({ email }) || await Cashier.findOne({ email });
+    if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+
+    user.lastLogin = new Date();
+    user.loginCount = (user.loginCount || 0) + 1;
+    await user.save();
+
+    const payload = { userId: user._id, email: user.email, role: user.role, name: user.name };
+    const accessToken = TokenManager.generateToken(payload);
+    const refreshToken = TokenManager.generateToken(payload, true);
+
+    const userData = {
+      _id: user._id, name: user.name, email: user.email, role: user.role,
+      lastLogin: user.lastLogin, loginCount: user.loginCount
     };
+    if (user.role === 'cashier' && user.shopId) {
+      userData.shopId = user.shopId;
+      userData.shopName = user.shopName;
+    }
+
+    await auditLogger.logLogin(user, req);
+
+    res.json({ success: true, user: userData, token: accessToken, refreshToken, message: 'Login successful' });
+  }
+);
+
+// ---------- Cashier password login ----------
+router.post('/cashier/login', loginLimiter, async (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password) {
+    return res.status(400).json({ success: false, message: 'Email and password required' });
   }
 
-  res.status(200).json({
-    success: true,
-    user: userData
-  });
-}));
+  const cashier = await Cashier.findOne({ email: email.toLowerCase().trim() })
+    .select('+password')
+    .populate('shopId', 'name location');
 
-// Check authentication status
-router.get('/check', asyncHandler(async (req, res) => {
-  res.status(200).json({
-    success: true,
-    message: 'Authentication service is running',
-    timestamp: new Date().toISOString(),
-    authType: 'session-based'
-  });
-}));
+  if (!cashier) return res.status(404).json({ success: false, message: 'Cashier not found' });
+  if (cashier.status !== 'active') return res.status(403).json({ success: false, message: 'Account inactive' });
+  if (!cashier.password) return res.status(401).json({ success: false, message: 'Password not set' });
 
-// Simple health check
-router.get('/health', (req, res) => {
-  res.status(200).json({
-    success: true,
-    message: 'Auth service healthy',
-    timestamp: new Date().toISOString()
+  let valid = false;
+  if (cashier.password.startsWith('$2')) {
+    valid = await bcrypt.compare(password, cashier.password);
+  } else {
+    valid = cashier.password === password;
+    if (valid) cashier.password = password; // triggers re-hash in pre-save
+  }
+
+  if (!valid) return res.status(401).json({ success: false, message: 'Invalid password' });
+
+  cashier.lastLogin = new Date();
+  cashier.loginCount = (cashier.loginCount || 0) + 1;
+  await cashier.save();
+
+  const payload = {
+    userId: cashier._id, email: cashier.email, role: 'cashier', name: cashier.name,
+    shopId: cashier.shopId?._id, shopName: cashier.shopId?.name || cashier.shopName
+  };
+  const accessToken = TokenManager.generateToken(payload);
+  const refreshToken = TokenManager.generateToken(payload, true);
+
+  await CashierSession.create({
+    cashierId: cashier._id,
+    token: accessToken,
+    deviceInfo: req.get('user-agent'),
+    ipAddress: req.ip,
+    expiresAt: new Date(Date.now() + 8 * 60 * 60 * 1000)
   });
+
+  await auditLogger.logLogin(cashier, req);
+
+  res.json({
+    success: true,
+    user: {
+      _id: cashier._id, name: cashier.name, email: cashier.email, phone: cashier.phone || '',
+      role: 'cashier', status: cashier.status, lastLogin: cashier.lastLogin,
+      loginCount: cashier.loginCount,
+      shopId: cashier.shopId?._id || null,
+      shopName: cashier.shopId?.name || cashier.shopName || null,
+      shopLocation: cashier.shopId?.location || null
+    },
+    token: accessToken,
+    refreshToken,
+    message: 'Cashier login successful'
+  });
+});
+
+// ---------- Refresh token ----------
+router.post('/refresh-token', async (req, res) => {
+  const { refreshToken } = req.body;
+  if (!refreshToken) return res.status(400).json({ success: false, message: 'Refresh token required' });
+
+  const decoded = TokenManager.verifyToken(refreshToken, true);
+  if (!decoded) return res.status(401).json({ success: false, message: 'Invalid refresh token' });
+
+  const user = await User.findById(decoded.userId) || await Cashier.findById(decoded.userId);
+  if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+
+  const payload = { userId: user._id, email: user.email, role: user.role, name: user.name, shopId: user.shopId, shopName: user.shopName };
+  const newAccessToken = TokenManager.generateToken(payload);
+  const newRefreshToken = TokenManager.generateToken(payload, true);
+
+  if (user.role === 'cashier') {
+    await CashierSession.updateOne(
+      { cashierId: user._id },
+      { token: newAccessToken, lastActivity: new Date(), expiresAt: new Date(Date.now() + 8 * 60 * 60 * 1000) }
+    );
+  }
+
+  res.json({ success: true, token: newAccessToken, refreshToken: newRefreshToken, message: 'Token refreshed' });
 });
 
 module.exports = router;

@@ -1,215 +1,178 @@
+// routes/cashiers.js
 const express = require('express');
-const router = express.Router();
-const Cashier = require('../models/Cashier');
 const bcrypt = require('bcryptjs');
-const jwt = require('jsonwebtoken');
-const catchAsync = require('../utils/catchAsync');
-const AppError = require('../utils/appError');
+const router = express.Router();
 
-// Load environment variables properly
-require('dotenv').config();
+const Cashier = require('../models/Cashier');
+const Transaction = require('../models/Transaction');
+const Shop = require('../models/Shop');
 
-// Validate JWT secret exists
-const JWT_SECRET = process.env.JWT_SECRET;
-if (!JWT_SECRET) {
-  console.error('FATAL ERROR: JWT_SECRET is not defined.');
-  process.exit(1);
-}
+const { protect, authorize } = require('../middleware/auth');
+const { CalculationUtils } = require('../utils/CalculationUtils');
 
-// Generate JWT token
-const generateToken = (id) => {
-  return jwt.sign(
-    { id, role: 'cashier' }, 
-    JWT_SECRET,
-    { expiresIn: process.env.JWT_EXPIRES_IN || '8h' }
-  );
-};
+router.use(protect);
 
 // GET all cashiers
-router.get('/', catchAsync(async (req, res, next) => {
-  const cashiers = await Cashier.find({}).select('-password');
-  res.status(200).json({
-    success: true,
-    count: cashiers.length,
-    data: cashiers
-  });
-}));
+router.get('/', async (req, res) => {
+  const { shopId, status, search, page = 1, limit = 20, withMetrics = 'false' } = req.query;
+  const filter = {};
 
-// POST /cashiers - Register new cashier (ADMIN ONLY)
-router.post('/', catchAsync(async (req, res, next) => {
-  const { name, email, password, phone, club } = req.body;
-  
-  // Validation - REMOVE phone from required fields
-  if (!name || !email || !password) {
-    return next(new AppError('Name, email, and password are required', 400));
+  if (shopId && shopId !== 'all') filter.shopId = shopId;
+  if (status && status !== 'all') filter.status = status;
+  if (search) {
+    filter.$or = [
+      { name: { $regex: search, $options: 'i' } },
+      { email: { $regex: search, $options: 'i' } },
+      { phone: { $regex: search, $options: 'i' } }
+    ];
   }
 
-  // Email format validation
-  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-  if (!emailRegex.test(email.toLowerCase())) {
-    return next(new AppError('Please provide a valid email address', 400));
+  const skip = (parseInt(page) - 1) * parseInt(limit);
+  const [cashiers, total] = await Promise.all([
+    Cashier.find(filter).populate('shopId', 'name location').sort({ createdAt: -1 }).skip(skip).limit(parseInt(limit)).lean(),
+    Cashier.countDocuments(filter)
+  ]);
+
+  let enhanced = cashiers;
+  if (withMetrics === 'true') {
+    const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+    enhanced = await Promise.all(cashiers.map(async (c) => {
+      const txs = await Transaction.find({ cashierId: c._id, status: 'completed', saleDate: { $gte: thirtyDaysAgo } }).lean();
+      const m = CalculationUtils.calculatePerformanceMetrics(txs);
+      return { ...c, metrics: { ...m, last30Days: { transactions: m.totalTransactions, revenue: m.totalRevenue, profit: m.totalProfit } } };
+    }));
   }
 
-  // Check if cashier already exists (only check email since phone is optional)
-  const existingCashier = await Cashier.findOne({ 
-    email: email.toLowerCase() 
+  res.json({
+    success: true, data: enhanced, count: enhanced.length, total,
+    page: parseInt(page), totalPages: Math.ceil(total / parseInt(limit))
   });
-  
-  if (existingCashier) {
-    return next(new AppError('Cashier with this email already exists', 400));
-  }
+});
 
-  // Create new cashier
-  const cashier = await Cashier.create({
-    name: name.trim(),
-    email: email.toLowerCase().trim(),
-    password,
-    phone: phone ? phone.trim() : '', // Handle optional phone
-    club: club || '',
-    role: 'cashier',
-    status: 'active'
-  });
-
-  // Generate token (optional for admin-created accounts)
-  const token = generateToken(cashier._id);
-
-  res.status(201).json({
-    success: true,
-    message: 'Cashier created successfully',
-    data: {
-      _id: cashier._id,
-      name: cashier.name,
-      email: cashier.email,
-      phone: cashier.phone,
-      club: cashier.club,
-      role: cashier.role,
-      status: cashier.status
-    },
-    token
-  });
-}));
-
-// PATCH /cashiers/:id - Update cashier
-router.patch('/:id', catchAsync(async (req, res, next) => {
+// GET cashier performance
+router.get('/:id/performance', async (req, res) => {
   const { id } = req.params;
-  const { name, email, phone, club, status } = req.body;
+  const { startDate, endDate, period = 'daily', dataType = 'withItems' } = req.query;
 
-  if (!name || !email) {
-    return next(new AppError('Name and email are required', 400));
+  const cashier = await Cashier.findById(id).populate('shopId', 'name location').lean();
+  if (!cashier) return res.status(404).json({ success: false, message: 'Cashier not found' });
+
+  let start = new Date(), end = new Date();
+  if (startDate && endDate) {
+    start = new Date(startDate);
+    end = new Date(endDate);
+  } else {
+    switch (period) {
+      case 'daily': start.setDate(start.getDate() - 1); break;
+      case 'weekly': start.setDate(start.getDate() - 7); break;
+      case 'monthly': start.setMonth(start.getMonth() - 1); break;
+      case 'annually': start.setFullYear(start.getFullYear() - 1); break;
+      default: start.setDate(start.getDate() - 1);
+    }
   }
+  start.setHours(0, 0, 0, 0);
+  end.setHours(23, 59, 59, 999);
 
-  // Email format validation
-  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-  if (!emailRegex.test(email.toLowerCase())) {
-    return next(new AppError('Please provide a valid email address', 400));
-  }
+  const txs = await Transaction.find({
+    cashierId: id, status: 'completed', saleDate: { $gte: start, $lte: end }
+  }).populate('shop', 'name').sort({ saleDate: -1 }).lean();
 
-  // Check if email already exists for other cashiers
-  const existingCashier = await Cashier.findOne({
-    $and: [
-      { _id: { $ne: id } },
-      { email: email.toLowerCase() }
-    ]
-  });
+  const metrics = CalculationUtils.calculatePerformanceMetrics(txs);
 
-  if (existingCashier) {
-    return next(new AppError('Email already in use by another cashier', 400));
-  }
-
-  const cashier = await Cashier.findByIdAndUpdate(
-    id,
-    { 
-      name: name.trim(), 
-      email: email.toLowerCase().trim(), 
-      phone: phone ? phone.trim() : '',
-      club: club || '',
-      status: status || 'active'
-    },
-    { new: true, runValidators: true }
-  ).select('-password');
-
-  if (!cashier) {
-    return next(new AppError('Cashier not found', 404));
-  }
-
-  res.status(200).json({
+  res.json({
     success: true,
-    message: 'Cashier updated successfully',
-    data: cashier
-  });
-}));
-
-// DELETE /cashiers/:id - Delete cashier
-router.delete('/:id', catchAsync(async (req, res, next) => {
-  const { id } = req.params;
-  
-  const cashier = await Cashier.findByIdAndDelete(id);
-
-  if (!cashier) {
-    return next(new AppError('Cashier not found', 404));
-  }
-
-  res.status(200).json({
-    success: true,
-    message: 'Cashier deleted successfully'
-  });
-}));
-
-// Cashier login - FIXED VERSION
-router.post('/login', catchAsync(async (req, res, next) => {
-  const { email, password } = req.body;
-  
-  console.log('Login attempt:', { email: email?.toLowerCase() });
-  
-  if (!email || !password) {
-    console.log('Missing email or password');
-    return next(new AppError('Email and password are required', 400));
-  }
-
-  // Find cashier by email only (since phone is optional now)
-  const cashier = await Cashier.findOne({
-    email: email.toLowerCase().trim(),
-    status: 'active'
-  }).select('+password');
-  
-  console.log('Found cashier:', cashier ? cashier.email : 'None');
-  
-  if (!cashier) {
-    console.log('No active cashier found with email:', email);
-    return next(new AppError('Invalid credentials or inactive account', 401));
-  }
-
-  // Use the verifyPassword method from the model
-  const isMatch = await cashier.verifyPassword(password);
-  console.log('Password match:', isMatch);
-  
-  if (!isMatch) {
-    console.log('Password does not match for:', cashier.email);
-    return next(new AppError('Invalid credentials', 401));
-  }
-
-  // Update last login
-  cashier.lastLogin = Date.now();
-  await cashier.save({ validateBeforeSave: false });
-
-  // Generate token
-  const token = generateToken(cashier._id);
-
-  res.status(200).json({
-    success: true,
-    message: 'Login successful',
     data: {
-      _id: cashier._id,
-      name: cashier.name,
-      email: cashier.email,
-      phone: cashier.phone,
-      club: cashier.club,
-      role: cashier.role,
-      status: cashier.status,
-      lastLogin: cashier.lastLogin
-    },
-    token
+      cashier: {
+        _id: cashier._id, name: cashier.name, email: cashier.email, phone: cashier.phone,
+        status: cashier.status, shopId: cashier.shopId?._id,
+        shopName: cashier.shopId?.name || cashier.shopName,
+        shopLocation: cashier.shopId?.location,
+        lastLogin: cashier.lastLogin, loginCount: cashier.loginCount
+      },
+      summary: {
+        totalRevenue: metrics.totalRevenue, totalSales: metrics.totalTransactions,
+        totalProfit: metrics.totalProfit, profitMargin: metrics.profitMargin,
+        totalItemsSold: metrics.totalItemsSold, performanceScore: metrics.performanceScore,
+        totalCost: metrics.totalCost,
+        paymentComposition: {
+          cash: metrics.totalCash, mpesa_bank: metrics.totalBankMpesa,
+          total: metrics.totalCash + metrics.totalBankMpesa,
+          cashPercentage: metrics.cashPercentage, mpesaBankPercentage: metrics.mpesaBankPercentage
+        },
+        averageTransactionValue: metrics.averageTransactionValue,
+        digitalPaymentRatio: metrics.digitalPaymentRatio
+      },
+      transactions: dataType === 'withItems' ? txs : [],
+      salesWithProfit: txs,
+      dailyPerformance: CalculationUtils.generateDailyBreakdown(txs),
+      topProducts: CalculationUtils.generateTopProducts(txs, 10),
+      recentTransactions: txs.slice(0, 20),
+      period: { start: start.toISOString().split('T')[0], end: end.toISOString().split('T')[0], period }
+    }
   });
-}));
+});
+
+// CREATE cashier
+router.post('/', authorize('admin', 'manager'), async (req, res) => {
+  const data = { ...req.body };
+  if (!data.email) return res.status(400).json({ success: false, message: 'Email required' });
+
+  const existing = await Cashier.findOne({ email: data.email.toLowerCase().trim() });
+  if (existing) return res.status(409).json({ success: false, message: 'Email exists' });
+
+  data.email = data.email.toLowerCase().trim();
+  data.role = 'cashier';
+  data.status = data.status || 'active';
+  if (data.password) data.password = await bcrypt.hash(data.password, 12);
+
+  if (data.shopId) {
+    const shop = await Shop.findById(data.shopId);
+    if (shop) data.shopName = shop.name;
+  }
+
+  const cashier = await Cashier.create(data);
+  await cashier.populate('shopId', 'name location');
+  res.status(201).json({ success: true, data: cashier, message: 'Cashier created' });
+});
+
+// UPDATE cashier
+router.put('/:id', authorize('admin', 'manager'), async (req, res) => {
+  const { id } = req.params;
+  const data = { ...req.body };
+
+  if (data.email) {
+    const dup = await Cashier.findOne({ email: data.email.toLowerCase().trim(), _id: { $ne: id } });
+    if (dup) return res.status(409).json({ success: false, message: 'Email exists' });
+    data.email = data.email.toLowerCase().trim();
+  }
+
+  if (data.password) data.password = await bcrypt.hash(data.password, 12);
+  else delete data.password;
+
+  if (data.shopId) {
+    const shop = await Shop.findById(data.shopId);
+    if (shop) data.shopName = shop.name;
+  }
+
+  const cashier = await Cashier.findByIdAndUpdate(id, data, { new: true, runValidators: true })
+    .populate('shopId', 'name location');
+  if (!cashier) return res.status(404).json({ success: false, message: 'Not found' });
+
+  res.json({ success: true, data: cashier, message: 'Cashier updated' });
+});
+
+// DELETE cashier
+router.delete('/:id', authorize('admin'), async (req, res) => {
+  const cashier = await Cashier.findByIdAndDelete(req.params.id);
+  if (!cashier) return res.status(404).json({ success: false, message: 'Not found' });
+  res.json({ success: true, data: cashier, message: 'Cashier deleted' });
+});
+
+// GET cashier by id
+router.get('/:id', async (req, res) => {
+  const cashier = await Cashier.findById(req.params.id).populate('shopId', 'name location').lean();
+  if (!cashier) return res.status(404).json({ success: false, message: 'Not found' });
+  res.json({ success: true, data: cashier });
+});
 
 module.exports = router;
